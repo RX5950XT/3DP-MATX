@@ -1,0 +1,10 @@
+# 文字檔在 repo 內一律 LF，checkout 時交給各平台
+* text=auto eol=lf
+
+# 二進位：絕對不能做行尾轉換（binary STL 會被改壞）
+*.stl   binary
+*.FCStd binary
+*.FCBak binary
+*.png   binary
+*.pdf   binary
+*.gcode binary

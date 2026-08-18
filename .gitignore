@@ -1,0 +1,33 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+
+# --- FreeCAD 備份／鎖檔 ---
+*.FCBak
+*.FCStd1
+
+# --- 機器特定的 ASCII junction ---
+# FreeCADCmd 收不到中文 argv，所以本機用 `scripts` 指向 `腳本`。
+# 它是絕對路徑，換機器就壞 → 不進版控，改由 README 的指令重建。
+/scripts
+
+# --- 驗證／切片產物（可重生）---
+測試/verify_out/
+result.json
+*.gcode
+*.3mf
+
+# --- 第三方規格書（版權）---
+# ATX12V / microATX / PCI Express CEM / SFF-8301 不重新散布。
+# 取得方式見 README「需自備的規格書」。
+參考/*.pdf
+測試/pdf_pages/
+
+# 從那些 PDF 抽出來的對照圖，衍生自上面同一批文件
+規格/_*.png
+規格/真板對齊證明.png
+
+# --- OS ---
+Thumbs.db
+desktop.ini
+.DS_Store
