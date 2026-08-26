@@ -17,7 +17,7 @@ D = load_params()
 import FreeCAD as App
 import Part
 
-import build_case as B  # 壓帽的相位驗算要用 place_mb_nut / make_mb_nut
+import build_case as B  # 共用螺紋、detent 與裝配幾何
 
 PATHS = D.project_paths()
 DOC_PATH = os.path.join(PATHS["cad"], D.FCSTD_NAME)
@@ -67,10 +67,42 @@ def pt_inside(shape, x, y, z, tol=0.15):
     return shape.isInside(App.Vector(x, y, z), tol, True)
 
 
+def support_overhangs(shape, thresh=None):
+    """
+    回傳 [(面積, 斜率, BoundBox)]：**平面**且法線朝下、斜率 < 門檻的面
+    ——切片器會在它下面長支撐的那些面。斜率自水平量起（90° = 垂直牆），
+    門檻的唯一來源是 `參數.SUPPORT_THRESHOLD_ANGLE`（= preset 的
+    support_threshold_angle，由 `驗切片設定.py` 比對）。
+
+    只看平面：曲面（孔壁、螺紋）的法線沿面變化，取中點法線會誤判。
+    那一類靠橋接與 support_remove_small_overhang 處理，不在這條檢查的射程內。
+    """
+    if thresh is None:
+        thresh = D.SUPPORT_THRESHOLD_ANGLE
+    out = []
+    for f in shape.Faces:
+        surf = getattr(f, "Surface", None)
+        if surf is None or "Plane" not in type(surf).__name__:
+            continue
+        try:
+            u0, u1, v0, v1 = f.ParameterRange
+            n = f.normalAt((u0 + u1) / 2, (v0 + v1) / 2)
+        except Exception:
+            continue
+        ln = n.Length or 1.0
+        nz = n.z / ln
+        if nz >= -1e-6:
+            continue
+        slope = 90.0 - math.degrees(math.asin(min(1.0, abs(nz))))
+        if slope < thresh:
+            out.append((float(f.Area), slope, f.BoundBox))
+    return out
+
+
 def obb(shape):
     """
-    `Shape.BoundBox` 對 B-spline 面是用**控制多邊形**算的，會虛胖
-    （實測壓帽真高 5.00 卻回報 10.00）。量尺寸一律走真外接盒。
+    `Shape.BoundBox` 對 B-spline 面是用控制多邊形算的，會虛胖；
+    解析螺紋件一律走真外接盒，避免把 spline 控制點包絡當成實體尺寸。
     """
     try:
         return shape.optimalBoundingBox(True)
@@ -147,6 +179,18 @@ def hardware_mocks():
             mk_box(hx - r, hy - r, D.BOARD_TOP_Z - D.PCB_T - 1, hx + r, hy + r, D.BOARD_TOP_Z + 1)
         )
     m["主板PCB"] = pcb
+    # ★ 第十三輪新增：**I/O 連接器區**。第十二輪的虛擬件只有 PCB 的長方體，
+    #   而 microATX Fig.5 的 note 說得很明白：連接器的**面**在 Datum B 後方
+    #   11.30 mm —— 比 PCB 後緣（10.16）還往後突出 1.14。虛擬件缺這一塊，
+    #   「後牆內面壓在連接器上」就永遠是綠的（硬規則 21：虛擬件要含它伸出去的東西）。
+    m["IO連接器區"] = mk_box(
+        D.IO_X0,
+        -D.IO_CONN_FACE_FROM_B,
+        D.IO_Z0,
+        D.IO_X1,
+        -D.IO_CONN_FACE_FROM_B + D.IO_CONN_DEPTH,
+        D.IO_Z1,
+    )
 
     # ── 規格淨空區（microATX 1.2 §2.4.1 Fig.7 / §2.4.2）──────────────
     # 「chassis features should not extend into the motherboard component area」
@@ -192,7 +236,7 @@ SPEC_HOLES_INTEL = {
 
 
 def main():
-    log("=== 3DP-MATX verify (第九輪：碟架承載/走線 · 前罩貼合 · PCIe 結構) ===")
+    log("=== 3DP-MATX verify（第十二輪：一體 Chassis／格柵／新固定件）===")
     if not os.path.isfile(DOC_PATH):
         fail(f"missing {DOC_PATH}")
         write_outs()
@@ -204,6 +248,17 @@ def main():
     log("objects: " + ", ".join(names))
 
     required = list(D.STL_NAMES)  # 硬規則 7：不手列
+    printable = {
+        o.Name for o in doc.Objects
+        if hasattr(o, "Shape") and not o.Shape.isNull()
+    }
+    expected = set(required)
+    (ok if printable == expected else fail)(
+        "CAD 可列印物件集合與 manifest 完全一致"
+        if printable == expected else
+        f"CAD/manifest 不一致 missing={sorted(expected - printable)} "
+        f"extra={sorted(printable - expected)}"
+    )
     shapes = {}
     for r in required:
         if r not in names:
@@ -217,17 +272,17 @@ def main():
         else:
             ok(f"no {bad}")
 
-    tray = shapes.get("Bottom_Tray")
-    rear = shapes.get("Rear_IO_PCIe")
+    chassis = shapes.get("Chassis_Body")
+    top = shapes.get("Top_MB")
     rack = shapes.get("HDD_Rack")
     dtray = shapes.get("HDD_Tray")
     shroud = shapes.get("Front_Shroud")
-    side_l, side_r = shapes.get("Side_Left_MB"), shapes.get("Side_Right_MB")
-    nut, bar = shapes.get("MB_Nut"), shapes.get("PCIeBar")
+    bar = shapes.get("PCIeBar")
+    screw = shapes.get("MB_Screw")
 
-    # ── 列印件必須是單一封閉實體 ──────────────────────────────
+    # ── 每個 STL 都必須是單一封閉實體 ─────────────────────────────
     log("--- solids ---")
-    for key in D.STRUCT_PART_KEYS:
+    for key in D.STL_NAMES:
         sh = shapes.get(key)
         if sh is None:
             continue
@@ -262,63 +317,122 @@ def main():
     else:
         fail("九孔 Y 又退回舊值（F 那顆不在 B 列上，Fig.7 標的是 .900=22.86）")
 
-    # ── 主板柱：階梯圓柱 + 印製壓帽（硬規則 6 三關）────────────────
-    log("--- MB standoff (印製螺柱 + 壓帽) ---")
+    # ── 主板固定：Ø8 支撐肩盲內牙 + 印製六角頭螺絲 ────────────────
+    log("--- MB standoff（盲內牙 + MB_Screw）---")
     stale = [
-        g for g in ("CAP_OD", "CAP_H", "CAP_COUNT", "MB_SCREW_TAP", "MB_SCREW_DEPTH",
-                    "MB_SCREW_HEAD_D") if hasattr(D, g)
+        g for g in (
+            "CAP_OD", "CAP_H", "CAP_COUNT", "MB_SCREW_TAP", "MB_SCREW_DEPTH",
+            "MB_STUD_MAJOR", "MB_STUD_MINOR", "MB_NUT_OD", "MB_NUT_H",
+        ) if hasattr(D, g)
     ]
-    if stale:
-        fail(f"上一版主板固定的參數還在：{stale}")
-    else:
-        ok("舊旋蓋／M3 自攻參數已清除")
-    depth = (D.MB_STUD_MAJOR - D.MB_STUD_MINOR) / 2
-    (ok if depth >= 0.5 - 1e-9 else fail)(f"關卡1 徑向牙深 {depth:.2f} >= 0.5")
-    (ok if D.MB_NUT_OD < D.MB_KEEPOUT_D else fail)(
-        f"關卡2 壓帽 Ø{D.MB_NUT_OD} < 九孔 keepout Ø{D.MB_KEEPOUT_D}"
+    (fail if stale else ok)(
+        f"{'退役主板固定參數仍存在：' + str(stale) if stale else '外凸 stud／壓帽參數已清除'}"
     )
-    (ok if D.MB_STUD_MAJOR < D.PCB_HOLE_D else fail)(
-        f"細軸 Ø{D.MB_STUD_MAJOR} < 主板孔 Ø{D.PCB_HOLE_D}"
-        f"（單邊 {(D.PCB_HOLE_D - D.MB_STUD_MAJOR) / 2:.2f}）"
+    depth = (D.MB_THREAD_MAJOR - D.MB_THREAD_MINOR) / 2
+    (ok if depth >= 0.5 - 1e-9 else fail)(f"徑向牙深 {depth:.2f} >= 0.5")
+    (ok if D.MB_SCREW_HEAD_D < D.MB_KEEPOUT_D else fail)(
+        f"六角頭外接圓 Ø{D.MB_SCREW_HEAD_D:.2f} < keepout Ø{D.MB_KEEPOUT_D}"
     )
-    crest = D.MB_STUD_PITCH * (1.0 - D.MB_STUD_ROOT_W) - 2 * D.MB_NUT_GAP
-    (ok if crest >= 0.4 else fail)(f"壓帽內牙牙頂寬 {crest:.2f} >= 0.4（噴頭）")
-    (ok if D.MB_NUT_H >= 2.0 * D.MB_STUD_PITCH else fail)(
-        f"旋合 {D.MB_NUT_H / D.MB_STUD_PITCH:.1f} 圈"
+    (ok if D.MB_THREAD_MAJOR < D.PCB_HOLE_D else fail)(
+        f"外牙 Ø{D.MB_THREAD_MAJOR} < PCB 孔 Ø{D.PCB_HOLE_D}"
     )
-    (ok if approx(D.MB_STUD_LEN, D.PCB_T + D.MB_NUT_H + 1.0, 1e-6) else fail)(
-        f"細軸長 {D.MB_STUD_LEN:.2f} = 板厚 + 壓帽 + 1.0（導出，非寫死）"
+    female_crest = D.MB_THREAD_PITCH * (1.0 - D.MB_THREAD_ROOT_W) - 2 * D.MB_THREAD_GAP
+    (ok if female_crest >= 0.8 else fail)(
+        f"內牙牙頂寬 {female_crest:.2f} >= 0.8（兩條 0.4 nozzle 線）"
     )
-    (ok if approx(D.SHOULDER_TOP_Z - D.FLOOR_T, 6.35, 1e-6) else fail)(
-        f"粗肩高 {D.SHOULDER_TOP_Z - D.FLOOR_T:.2f} = 板底淨空 6.35（§2.4.2）"
+    (ok if approx(D.MB_THREAD_ENGAGEMENT / D.MB_THREAD_PITCH, 2.0, 1e-6) else fail)(
+        f"軸向旋合 {D.MB_THREAD_ENGAGEMENT:.2f} mm = "
+        f"{D.MB_THREAD_ENGAGEMENT / D.MB_THREAD_PITCH:.1f} 圈"
     )
-    if tray:
-        tb = obb(tray)
-        (ok if approx(tb.ZMax, D.MB_STUD_TOP_Z, 0.05) else fail)(
-            f"tray ZMax={tb.ZMax:.2f} = 細軸頂 {D.MB_STUD_TOP_Z:.2f}"
+    (ok if approx(D.MB_SCREW_THREAD_LEN,
+                  D.PCB_T + D.MB_THREAD_ENGAGEMENT, 1e-6) else fail)(
+        f"螺絲牙長 {D.MB_SCREW_THREAD_LEN:.2f} = PCB {D.PCB_T} + 旋合 {D.MB_THREAD_ENGAGEMENT}"
+    )
+    (ok if approx(D.MB_SOCKET_DEPTH,
+                  D.MB_THREAD_ENGAGEMENT + D.MB_SOCKET_END_GAP, 1e-6) else fail)(
+        f"盲孔深 {D.MB_SOCKET_DEPTH:.2f} = 旋合 + 端隙 {D.MB_SOCKET_END_GAP}"
+    )
+    (ok if D.MB_SOCKET_BOTTOM_MATERIAL >= 0.8 else fail)(
+        f"盲孔底料 {D.MB_SOCKET_BOTTOM_MATERIAL:.2f} >= 0.8"
+    )
+    # 頭頂十字工具槽（第十四輪；使用者：螺絲上面要有十字的孔）。
+    # 螺絲頭面貼床印，槽開在貼床那一面 → 槽是第一層的孔，不需支撐。
+    (ok if D.MB_SCREW_CROSS_W >= 0.5 else fail)(
+        f"十字臂寬 {D.MB_SCREW_CROSS_W:.2f} >= 0.5 最小可印特徵"
+    )
+    (ok if D.MB_SCREW_CROSS_WALL >= 0.8 else fail)(
+        f"十字外側餘料 {D.MB_SCREW_CROSS_WALL:.2f} >= 0.8"
+    )
+    (ok if D.MB_SCREW_CROSS_ROOF >= 0.8 else fail)(
+        f"十字槽頂料 {D.MB_SCREW_CROSS_ROOF:.2f} >= 0.8（也是那一層的橋接底）"
+    )
+    (ok if D.MB_SCREW_CROSS_DEPTH < D.MB_SCREW_HEAD_H else fail)(
+        f"槽深 {D.MB_SCREW_CROSS_DEPTH:.2f} < 頭厚 {D.MB_SCREW_HEAD_H}（不吃到牙）"
+    )
+    # 探點用**列印姿態**的原型：doc 裡的 MB_Screw 是總成位（已翻轉並平移到 B 孔）。
+    raw_screw = B.make_mb_screw()
+    if raw_screw is not None:
+        zc = D.MB_SCREW_CROSS_DEPTH / 2
+        arm = D.MB_SCREW_CROSS_L / 2
+        empties = [
+            ("槽心", 0.0, 0.0, zc),
+            ("+X 臂末", arm - 0.3, 0.0, zc),
+            ("-X 臂末", -(arm - 0.3), 0.0, zc),
+            ("+Y 臂末", 0.0, arm - 0.3, zc),
+            ("-Y 臂末", 0.0, -(arm - 0.3), zc),
+        ]
+        bad = [n for n, x, y, z in empties if pt_inside(raw_screw, x, y, z)]
+        (fail if bad else ok)(
+            f"{'十字槽沒挖穿：' + str(bad) if bad else '十字五個探點皆為空腔'}"
         )
-        z_floor = D.FLOOR_T + 0.3
-        z_board = D.SHOULDER_TOP_Z + D.PCB_T / 2
-        r_maj, r_sh = D.MB_STUD_MAJOR / 2, D.SHOULDER_OD / 2
+        # 非 vacuous：圓孔／方孔也會讓上面五點變空，象限角必須是實心才算十字。
+        q = D.MB_SCREW_CROSS_W / 2 + 0.4
+        solids = [
+            ("象限角", q, q, zc),
+            ("槽外料", arm + 0.6, 0.0, zc),
+            ("槽頂料", 0.0, 0.0, D.MB_SCREW_CROSS_DEPTH + D.MB_SCREW_CROSS_ROOF / 2),
+        ]
+        hollow = [n for n, x, y, z in solids if not pt_inside(raw_screw, x, y, z)]
+        (fail if hollow else ok)(
+            f"{'應有料處是空的：' + str(hollow) if hollow else '象限角／槽外／槽頂皆實心（是十字不是圓孔）'}"
+        )
+    (ok if approx(D.SHOULDER_TOP_Z - D.FLOOR_T, 6.35, 1e-6) else fail)(
+        f"粗肩高 {D.SHOULDER_TOP_Z - D.FLOOR_T:.2f} = 板底淨空 6.35"
+    )
+    if chassis is not None:
+        aligned_bad = []
         for letter, (hx, hy) in D.HOLES_MM.items():
-            if not pt_inside(tray, hx, hy, z_floor, 0.02):
-                fail(f"standoff {letter}: 粗肩沒有實心")
-            elif not pt_inside(tray, hx, hy, D.SHOULDER_TOP_Z + 1.0, 0.02):
-                fail(f"standoff {letter}: 細軸不存在")
-            elif pt_inside(tray, hx + r_maj + 0.20, hy, z_board, 0.02):
-                fail(f"standoff {letter}: 板厚高度有超出 Ø{D.MB_STUD_MAJOR} 的料 — 板穿不過")
-            elif not pt_inside(tray, hx + r_sh - 0.6, hy, z_floor, 0.02):
-                fail(f"standoff {letter}: 粗肩被掏空")
+            placed = B.place_mb_screw(B.make_mb_screw(), hx, hy)
+            v = common_vol(placed, chassis)
+            if v > INTERFERE_MAX:
+                aligned_bad.append(f"{letter}:{v:.1f}")
+            if pt_inside(chassis, hx, hy, D.SHOULDER_TOP_Z + 0.2, 0.02):
+                fail(f"standoff {letter}: PCB 上方仍有 Chassis 凸柱")
+            elif not pt_inside(chassis, hx, hy, D.MB_SOCKET_BOTTOM_Z - 0.3, 0.02):
+                fail(f"standoff {letter}: 盲孔打穿底料")
+            elif not pt_inside(chassis, hx + D.SHOULDER_OD / 2 - 0.5, hy,
+                               D.FLOOR_T + 0.3, 0.02):
+                fail(f"standoff {letter}: Ø8 支撐肩不實")
             else:
-                ok(f"standoff {letter} 粗肩 Ø{D.SHOULDER_OD} + 細軸 Ø{D.MB_STUD_MAJOR}")
-    if nut is not None:
-        nb = obb(nut)
-        if approx(nb.ZMin, D.BOARD_TOP_Z, 0.05) and approx(nb.ZMax, D.BOARD_TOP_Z + D.MB_NUT_H, 0.05):
-            ok(f"壓帽底面壓在板面 z={nb.ZMin:.2f}，高 {D.MB_NUT_H}")
-        else:
-            fail(f"壓帽 z={nb.ZMin:.2f}..{nb.ZMax:.2f} 沒壓在板面 {D.BOARD_TOP_Z:.2f}")
-        od = max(nb.XLength, nb.YLength)
-        (ok if od <= D.MB_KEEPOUT_D else fail)(f"壓帽實際外徑 {od:.2f} <= keepout {D.MB_KEEPOUT_D}")
+                ok(f"standoff {letter}：肩實、盲孔底實、PCB 上方無凸柱")
+        (fail if aligned_bad else ok)(
+            f"MB_Screw {'工作相位撞 Chassis：' + str(aligned_bad) if aligned_bad else '九孔皆可到工作位'}"
+        )
+        hx, hy = D.HOLES_MM["B"]
+        turned = B.place_mb_screw(B.make_mb_screw(), hx, hy)
+        turned.rotate(App.Vector(hx, hy, 0), App.Vector(0, 0, 1), 180.0)
+        phase_v = common_vol(turned, chassis)
+        (ok if phase_v > INTERFERE_MAX else fail)(
+            f"真螺旋：相位轉 180° 撞 {phase_v:.1f} mm³"
+            if phase_v > INTERFERE_MAX else
+            f"相位轉 180° 只撞 {phase_v:.2f} mm³——疑似軸對稱假牙"
+        )
+    if screw is not None:
+        sb = obb(screw)
+        (ok if approx(sb.ZMin, D.SHOULDER_TOP_Z - D.MB_THREAD_ENGAGEMENT, 0.05)
+         and approx(sb.ZMax, D.MB_SCREW_HEAD_TOP_Z, 0.05) else fail)(
+            f"總成螺絲 Z={sb.ZMin:.2f}..{sb.ZMax:.2f}，旋入 5 mm 且頭壓 PCB"
+        )
 
     # ── 電源上置（本輪主訴）────────────────────────────────────────
     log("--- 電源上置 / Area A 淨空 ---")
@@ -394,25 +508,23 @@ def main():
     (ok if D.ATX_X1 <= D.AREA_B_X0 else fail)(
         f"電源右緣 {D.ATX_X1:.2f} <= Area A/B 界線 {D.AREA_B_X0:.2f}（投影仍整片在 Area A）"
     )
-    if rear is not None:
+    if chassis is not None:
         # 後牆承托凸緣（電源坐在上面）
         y_led = D.CASE_REAR + D.WALL + D.PSU_LEDGE_W / 2
-        (ok if pt_inside(rear, D.ATX_X0 + 80, y_led, D.ATX_Z0 - D.PSU_LEDGE_T / 2, 0.02) else fail)(
+        (ok if pt_inside(chassis, D.ATX_X0 + 80, y_led, D.ATX_Z0 - D.PSU_LEDGE_T / 2, 0.02) else fail)(
             "後牆 PSU 承托凸緣實心"
         )
-        (fail if pt_inside(rear, D.ATX_X0 + 80, y_led, D.ATX_Z0 - D.PSU_LEDGE_T - 2.0, 0.02) else ok)(
+        (fail if pt_inside(chassis, D.ATX_X0 + 80, y_led, D.ATX_Z0 - D.PSU_LEDGE_T - 2.0, 0.02) else ok)(
             "承托凸緣底面 = Area A 淨空頂（沒有再往下長）"
         )
-    if side_l is not None:
+    if chassis is not None:
         x_led = D.CASE_LEFT + D.WALL + D.PSU_LEDGE_W / 2
-        (ok if pt_inside(side_l, x_led, 60.0, D.ATX_Z0 - D.PSU_LEDGE_T / 2, 0.02) else fail)(
+        (ok if pt_inside(chassis, x_led, 60.0, D.ATX_Z0 - D.PSU_LEDGE_T / 2, 0.02) else fail)(
             "左側板 PSU 長肩實心（電源左緣整條坐在上面）"
         )
 
     # ── 走線：電源與主板同一個空間（使用者主訴「根本無法走線」）──────
     log("--- 走線淨空 ---")
-    parts_all = list(shapes.values())
-
     def occupant(x, y, z, skip=()):
         """回傳「佔住這個點的零件名」，沒有就 None。要空的地方用它 == None。"""
         for pn, sh in shapes.items():
@@ -454,29 +566,29 @@ def main():
 
     # ── 單一長方體外殼 ────────────────────────────────────────────
     log("--- 單一長方體 ---")
-    # ★ 第九輪改成**體積**檢查，不是 bbox。理由是目視複檢時抓到的：
-    #   `optimalBoundingBox(True)` 對球面會受三角網狀態影響 —— GUI 已經 tessellate 過的
-    #   同一個側板回報 XMin −215.5471，headless 回報 −215.4900，差 0.057。
-    #   拿它跟 ±0.05 的門檻比，同一份幾何在兩個環境會給出不同答案。
-    #   「這一片有沒有料伸出長方體」本來就該用布林量，量出來是 0 就是 0。
-    env = mk_box(D.CASE_LEFT, D.CASE_REAR, -D.SKIRT_H, D.CASE_RIGHT, D.CASE_FRONT, D.OUTER_TOP_Z)
-    hook_out = D.CASE_REAR - (D.PCIE_HOOK_NECK_D + D.PCIE_HOOK_HEAD_D)
-    env_rear = mk_box(
-        D.CASE_LEFT, hook_out, -D.SKIRT_H, D.CASE_RIGHT, D.CASE_FRONT, D.OUTER_TOP_Z
+    env = mk_box(D.CASE_LEFT, D.CASE_REAR, -D.SKIRT_H,
+                 D.CASE_RIGHT, D.CASE_FRONT, D.OUTER_TOP_Z)
+    env_chassis = mk_box(
+        D.CASE_LEFT,
+        D.CASE_REAR - D.PCIE_RIB_D,
+        -D.SKIRT_H,
+        D.CASE_RIGHT,
+        D.CASE_FRONT,
+        D.OUTER_TOP_Z,
     )
     for key, sh in shapes.items():
-        if key in ("PCIeBlank", "PCIeBar"):  # 備件停放在外；壓條**故意**長在後牆外
-            continue
-        # 後牆外表面有 keyhole 蘑菇柱（使用者要的「凸出來的結構」）與肋的外側補強
-        e = env_rear if key == "Rear_IO_PCIe" else env
+        if key in ("PCIeBlank", "PCIeBar"):
+            continue  # 備件停放在外；壓條是外掛固定件
+        e = env_chassis if key == "Chassis_Body" else env
         v = sh.cut(e).Volume
         (ok if v <= INTERFERE_MAX else fail)(
-            f"{key} 在外殼長方體內（外溢 {v:.2f} mm³）"
+            f"{key} 在允許包絡內（外溢 {v:.2f} mm³）"
         )
-    (ok if D.PCIE_RIB_D <= D.PCIE_HOOK_NECK_D + D.PCIE_HOOK_HEAD_D else fail)(
-        f"肋外側補強 {D.PCIE_RIB_D} <= keyhole 柱凸出 "
-        f"{D.PCIE_HOOK_NECK_D + D.PCIE_HOOK_HEAD_D:.2f}（後牆外最凸的仍是柱）"
-    )
+    if chassis is not None:
+        print_rear = D.CASE_REAR - obb(chassis).YMin
+        (ok if approx(print_rear, D.PCIE_RIB_D, 0.05) else fail)(
+            f"一體件列印後凸 {print_rear:.2f} = PCIe 補強 {D.PCIE_RIB_D:.2f}"
+        )
     # 前段不再矮一階：前罩要長到牆頂
     if shroud is not None:
         (ok if pt_inside(shroud, D.CASE_LEFT + D.WALL / 2, D.CASE_FRONT - 20, D.OUTER_TOP_Z - 1.0)
@@ -506,7 +618,7 @@ def main():
     (ok if not miss else fail)(f"機殼底緣整圈落地{'' if not miss else miss}")
 
     # ── I/O ───────────────────────────────────────────────────────
-    if rear:
+    if chassis:
         log("--- I/O ---")
         y_mid = D.CASE_REAR + D.WALL / 2
         if approx(D.IO_W, 158.75) and approx(D.IO_H, 44.45):
@@ -518,13 +630,43 @@ def main():
         (ok if approx(D.IO_Z0, D.BOARD_TOP_Z - 3.81, 1e-6) else fail)(
             f"IO 開孔底 {D.IO_Z0:.2f} = 板面 − 3.81（p13）"
         )
+        # ★ 第十三輪：Fig.4 有**兩張圖**，前十二輪只用了正視圖。側視圖同時給了
+        #   Z 的第二基準與整條深度基準；兩個 Z 基準都成立才算真的對上。
+        (ok if approx(D.IO_FROM_STANDOFF_TOP, 2.24, 1e-6) else fail)(
+            f"Fig.4 側視 literal .088 [2.24] 未被改動（現值 {D.IO_FROM_STANDOFF_TOP}）"
+        )
+        (ok if approx(D.IO_Z0, D.SHOULDER_TOP_Z - D.IO_FROM_STANDOFF_TOP, 1e-6) else fail)(
+            f"IO 開孔底 {D.IO_Z0:.2f} = 支撐肩頂 {D.SHOULDER_TOP_Z:.2f} − 2.24"
+            f"（Fig.4 側視第二基準：from bottom surface of motherboard / top of standoffs）"
+        )
+        (ok if approx(D.IO_APERTURE_FROM_B, 12.27, 1e-6) else fail)(
+            f"Fig.4 側視 literal 0.483 [12.27] 未被改動（現值 {D.IO_APERTURE_FROM_B}）"
+        )
+        (ok if approx(D.IO_CONN_FACE_FROM_B, 11.30, 1e-6) else fail)(
+            f"Fig.5 note literal .445 [11.30] 未被改動（現值 {D.IO_CONN_FACE_FROM_B}）"
+        )
+        (ok if approx(D.CASE_REAR + D.WALL, -D.IO_APERTURE_FROM_B, 1e-6) else fail)(
+            f"後牆內面 {D.CASE_REAR + D.WALL:.2f} = I/O aperture 平面 "
+            f"−{D.IO_APERTURE_FROM_B:.2f}（不是「板緣 − MARGIN − WALL」）"
+        )
+        conn_gap = (-D.IO_CONN_FACE_FROM_B) - (D.CASE_REAR + D.WALL)
+        (ok if conn_gap > 0.0 else fail)(
+            f"I/O 連接器面 −{D.IO_CONN_FACE_FROM_B:.2f} 在後牆內面之內，留 "
+            f"{conn_gap:.2f} mm 給 I/O shield"
+            if conn_gap > 0.0 else
+            f"I/O 連接器面戳進後牆料 {-conn_gap:.2f} mm —— 主板推不到底"
+        )
+        (ok if -D.IO_CONN_FACE_FROM_B < D.BOARD_REAR else fail)(
+            f"連接器面比 PCB 後緣 {D.BOARD_REAR:.2f} 還往後突出 "
+            f"{D.BOARD_REAR - (-D.IO_CONN_FACE_FROM_B):.2f}（Fig.5：這就是 MARGIN=0.5 不夠的原因）"
+        )
         io_cx, io_cz = (D.IO_X0 + D.IO_X1) / 2, (D.IO_Z0 + D.IO_Z1) / 2
-        (fail if pt_inside(rear, io_cx, y_mid, io_cz) else ok)("IO opening void")
+        (fail if pt_inside(chassis, io_cx, y_mid, io_cz) else ok)("IO opening void")
         edge = D.io_edge_material()
         (ok if edge >= D.IO_KEEPOUT + 0.8 else fail)(
             f"IO outer edge material {edge:.2f} >= keepout {D.IO_KEEPOUT}+0.8"
         )
-        (ok if pt_inside(rear, D.IO_X0 - D.IO_KEEPOUT / 2, D.CASE_REAR + D.WALL - 0.3, io_cz)
+        (ok if pt_inside(chassis, D.IO_X0 - D.IO_KEEPOUT / 2, D.CASE_REAR + D.WALL - 0.3, io_cz)
          else fail)("IO keepout band on panel (inner face solid)")
         (ok if 0.94 <= D.IO_CLIP_T <= 1.32 else fail)(f"IO clip T={D.IO_CLIP_T} in 0.94-1.32")
 
@@ -568,7 +710,7 @@ def main():
             f"目前依使用者指定取 PSU_FAN_DOWN={D.PSU_FAN_DOWN}（風扇朝主機板）"
         )
         for i, (hx, hz) in enumerate(D.ATX_HOLES):
-            (fail if pt_inside(rear, D.ATX_X0 + hx, y_mid, D.ATX_Z0 + hz) else ok)(
+            (fail if pt_inside(chassis, D.ATX_X0 + hx, y_mid, D.ATX_Z0 + hz) else ok)(
                 f"ATX mount hole {i} open"
             )
         wx0, wx1 = D.ATX_X0 + D.PSU_WIN_X0, D.ATX_X0 + D.PSU_WIN_X1
@@ -579,7 +721,7 @@ def main():
             ("風扇下緣", D.ATX_X0 + 56.0, wz0 + 2.0),
             ("風扇上緣", D.ATX_X0 + 56.0, wz1 - 2.0),
         ):
-            (fail if pt_inside(rear, xx, y_mid, zz) else ok)(f"PSU window open at {tag}")
+            (fail if pt_inside(chassis, xx, y_mid, zz) else ok)(f"PSU window open at {tag}")
         for i, (hx, hz) in enumerate(D.ATX_HOLES):
             hxw, hzw = D.ATX_X0 + hx, D.ATX_Z0 + hz
             edge = min(
@@ -643,9 +785,9 @@ def main():
             f"tang pocket {D.PCIE_TANG_POCKET} > stock {D.PCIE_BRACKET_T}"
         )
         y_wall = D.CASE_REAR + D.WALL / 2
-        z_tie = D.PCIE_Z1 + D.PCIE_LIFT + D.PCIE_TIE_H / 2
+        z_tie = (D.PCIE_TIE_Z0 + D.PCIE_TIE_Z1) / 2
         for tag, xx in (("between slots", (min(centers) + max(centers)) / 2), ("over slot", centers[0])):
-            (ok if pt_inside(rear, xx, y_wall, z_tie) else fail)(f"PCIe tie bar solid {tag}")
+            (ok if pt_inside(chassis, xx, y_wall, z_tie) else fail)(f"PCIe tie bar solid {tag}")
         z_open_mid = (D.PCIE_Z0 + D.PCIE_Z1) / 2
         # ★ 第九輪：肋不能只驗「中間有料」。第八輪的橫縫把肋的**上端切斷**，
         #   而「繫樑實心」那條探的是橫縫**上方**那塊料——上方確實還是實心，
@@ -659,16 +801,16 @@ def main():
                 z_open_mid,
                 D.PCIE_Z1,
                 D.PCIE_Z1 + D.PCIE_LIFT / 2,
-                D.PCIE_Z1 + D.PCIE_LIFT + D.PCIE_TIE_H / 2,  # 上固定端（繫樑）
+                (D.PCIE_TIE_Z0 + D.PCIE_TIE_Z1) / 2,  # 上固定端（繫樑）
             ]
-            gaps = [z for z in zs if not pt_inside(rear, xm, y_wall, z, 0.02)]
+            gaps = [z for z in zs if not pt_inside(chassis, xm, y_wall, z, 0.02)]
             (fail if gaps else ok)(
                 f"肋 x={xm:.2f} 上下貫通"
                 if not gaps
                 else f"肋 x={xm:.2f} 在 z={['%.1f' % z for z in gaps]} 斷掉 → 懸臂"
             )
             # 往機殼外加厚的補強（斷面 1.42×2.40 → 1.42×6.40）
-            (ok if pt_inside(rear, xm, D.CASE_REAR - D.PCIE_RIB_D / 2, z_open_mid, 0.02) else fail)(
+            (ok if pt_inside(chassis, xm, D.CASE_REAR - D.PCIE_RIB_D / 2, z_open_mid, 0.02) else fail)(
                 f"肋 x={xm:.2f} 外側補強實心（深 {D.PCIE_RIB_D}）"
             )
         rib_w = D.PCIE_PITCH - D.PCIE_OPEN_W
@@ -686,9 +828,9 @@ def main():
             ("底檻", (min(centers) + max(centers)) / 2, D.PCIE_Z0 - 2.0),
             ("左柱", fx0 + 1.0, (D.PCIE_Z0 + D.PCIE_Z1) / 2),
             ("右柱", fx1 - 1.0, (D.PCIE_Z0 + D.PCIE_Z1) / 2),
-            ("肋頂（壓條下緣之下）", (cs_sorted[0] + cs_sorted[1]) / 2, fz1 - 1.0),
+            ("繫樑（肋的上端固定端）", (cs_sorted[0] + cs_sorted[1]) / 2, fz1 - 1.0),
         ):
-            (ok if pt_inside(rear, xx, y_boss, zz, 0.02) else fail)(
+            (ok if pt_inside(chassis, xx, y_boss, zz, 0.02) else fail)(
                 f"PCIe 窗框{tag}外側補強實心（總厚 {D.WALL + D.PCIE_RIB_D:.2f}）"
             )
         (ok if fx0 >= D.IO_X1 else fail)(
@@ -697,35 +839,111 @@ def main():
         (ok if fx1 <= D.CASE_RIGHT + 1e-9 else fail)(
             f"窗框補強右端 {fx1:.2f} <= 機殼外表面 {D.CASE_RIGHT:.2f}"
         )
-        (ok if fz1 <= D.PCIE_BAR_Z0 - D.SLIDE_FIT + 1e-9 else fail)(
-            f"窗框補強頂 {fz1:.2f} 讓開壓條下緣 {D.PCIE_BAR_Z0:.2f}"
+        (ok if approx(fz1, D.PCIE_TIE_Z1, 1e-6) else fail)(
+            f"窗框補強頂 {fz1:.2f} = 繫樑頂 {D.PCIE_TIE_Z1:.2f}"
+            f"（第十三輪：壓條在補強層外面，y 不重疊，不必為它讓開；"
+            f"補強不長到這裡的話兩個盲牙就鑽在只有 {D.WALL} 厚的牆上）"
+        )
+        # ★ 第十三輪：開孔頂改 45° 尖頂 —— 使用者實印時拆支撐把三根 1.42 的肋
+        #   一起扯斷。根因不是肋不夠粗，是那四個開孔**需要支撐**（頂是 18.9 mm
+        #   寬的水平懸空，切片器在 118 mm 深的槽裡長支撐塔，塔與肋咬死）。
+        #   驗的是「頂上沒有水平面」：沿尖頂逐點量寬度，必須線性收斂成 45°。
+        (ok if approx(D.PCIE_OPEN_Z1, D.PCIE_Z1 + D.PCIE_LIFT, 1e-6) else fail)(
+            f"全寬開孔頂 {D.PCIE_OPEN_Z1:.2f} = 擋板頂 + 抬升 {D.PCIE_LIFT:.2f}"
+            f"（尖頂自這裡起算，抬升一點都沒有少）"
+        )
+        (ok if approx(D.PCIE_APEX_H, D.PCIE_OPEN_W / 2, 1e-6) else fail)(
+            f"45° ⇒ 尖頂高 {D.PCIE_APEX_H:.2f} = 半寬 {D.PCIE_OPEN_W / 2:.2f}"
+        )
+        cx0 = centers[0]
+        bad_apex = []
+        for frac in (0.1, 0.3, 0.5, 0.7, 0.9):
+            zz = D.PCIE_OPEN_Z1 + frac * D.PCIE_APEX_H
+            half = (1.0 - frac) * D.PCIE_OPEN_W / 2
+            # 收斂線內側 0.4 應該是空的、外側 0.4 應該有料
+            if pt_inside(chassis, cx0 + half - 0.4, y_wall, zz, 0.02):
+                bad_apex.append(f"z={zz:.1f} 內側有料")
+            if not pt_inside(chassis, cx0 + half + 0.4, y_wall, zz, 0.02):
+                bad_apex.append(f"z={zz:.1f} 外側無料")
+        (fail if bad_apex else ok)(
+            "開孔頂是 45° 尖頂，沒有水平懸空面（逐點量 5 個高度）"
+            if not bad_apex else f"尖頂輪廓不對：{bad_apex}"
+        )
+        (ok if pt_inside(chassis, cx0, y_wall, D.PCIE_APEX_Z + 1.0, 0.02) else fail)(
+            f"尖頂頂點 {D.PCIE_APEX_Z:.2f} 之上是繫樑實料（肋的上端固定端）"
         )
         # 舌袋所在的底檻厚度（第九輪挖完只剩 1.10）
         sill_t = D.WALL + D.PCIE_RIB_D - D.PCIE_TANG_POCKET
         (ok if sill_t >= 3.0 else fail)(
             f"擋板舌袋背後剩料 {sill_t:.2f} mm（第九輪 {D.WALL - D.PCIE_TANG_POCKET:.2f}）"
         )
-        # keyhole 蘑菇柱的頸斷面（整條壓條掛在這兩根上）
-        neck_a = D.PCIE_HOOK_NECK_W * D.PCIE_HOOK_NECK_D
-        (ok if neck_a >= 40.0 else fail)(
-            f"蘑菇柱頸斷面 {D.PCIE_HOOK_NECK_W:.1f}×{D.PCIE_HOOK_NECK_D:.1f} = {neck_a:.1f} mm²"
-            f"（第九輪 4.0×5.5 = 22.0）"
-        )
         # 抬升帶不得再被打成連續橫縫（那是第八輪讓肋懸空的原因）
-        (ok if pt_inside(rear, D.CASE_RIGHT - 1.0, y_wall, D.PCIE_Z1 + D.PCIE_LIFT / 2, 0.02)
+        (ok if pt_inside(chassis, D.CASE_RIGHT - 1.0, y_wall, D.PCIE_Z1 + D.PCIE_LIFT / 2, 0.02)
          else fail)("抬升帶沒有連續橫縫（機殼右緣那段仍是實料）")
+
+        # ★ 第十四輪：支撐地圖。使用者第二次回報「拆支撐把三根細桿扯斷」——
+        #   第十三輪的尖頂讓開孔本身不生支撐了，但真正貼著肋的是**別的東西的
+        #   支撐塔**：任何位在 PCIe 開孔 x 帶上方的朝下面，都要從床長一根塔
+        #   一路擦過那三根肋上來。所以這裡分兩段驗：
+        #     ① 窗區內（z ≤ 繫樑頂）一片都不准有 —— FAIL
+        #     ② 窗區之上還有哪些 —— WARN 逐條列出（塔高＝那個 z），
+        #        它們不是缺陷（鉤唇的底面做不出 45°：往下 4.5 mm 就是頂蓋本體），
+        #        但必須被記著，不然下一輪又會變成「不知道哪來的支撐」。
+        # 帶界＝**四個開孔的 x 跨距**（三根肋就在裡面），不是窗框跨距：
+        # 窗框還往左右各多 PCIE_FRAME_M，那一段的塔擦不到肋。
+        cs = D.pcie_centers()
+        ox0 = min(cs) - D.PCIE_OPEN_W / 2
+        ox1 = max(cs) + D.PCIE_OPEN_W / 2
+        oh = support_overhangs(chassis)
+
+        def in_x(bb, x0, x1):
+            return bb.XMax > x0 and bb.XMin < x1
+
+        in_band = [
+            (a, sl, bb) for a, sl, bb in oh
+            if in_x(bb, ox0, ox1) and bb.ZMax > D.FLOOR_T and bb.ZMin < D.PCIE_TIE_Z1
+        ]
+        (fail if in_band else ok)(
+            "PCIe 開孔帶（x %.1f~%.1f、z %.1f~%.1f）沒有需支撐的平面朝下面"
+            % (ox0, ox1, D.FLOOR_T, D.PCIE_TIE_Z1)
+            if not in_band else
+            "PCIe 開孔帶仍有 %d 片需支撐朝下面，共 %.1f mm²：%s"
+            % (len(in_band), sum(a for a, _, _ in in_band),
+               [f"z={bb.ZMin:.2f}/{a:.0f}mm²" for a, _, bb in in_band])
+        )
+        fx0, fx1 = D.pcie_frame_x()
+        beside = sorted(
+            ((a, bb) for a, sl, bb in oh
+             if in_x(bb, fx0, fx1) and not in_x(bb, ox0, ox1)
+             and bb.ZMax > D.FLOOR_T and bb.ZMin < D.PCIE_TIE_Z1),
+            key=lambda r: -r[0],
+        )
+        for a, bb in beside:
+            warn("窗框旁（x %.1f~%.1f，開孔帶外）z=%.2f 有 %.0f mm² 朝下面 → "
+                 "塔在肋的左右，不在肋之間"
+                 % (bb.XMin, bb.XMax, bb.ZMin, a))
+        above = sorted(
+            ((a, bb) for a, sl, bb in oh
+             if in_x(bb, ox0, ox1) and bb.ZMin >= D.PCIE_TIE_Z1),
+            key=lambda r: -r[0],
+        )
+        for a, bb in above:
+            warn("PCIe 帶上方 z=%.2f 有 %.0f mm² 朝下面 → 支撐塔會擦過三根肋 "
+                 "（塔高 %.0f mm；已把 TOP_HOOK_D 減到 %.1f，剩下的靠 preset 的 "
+                 "support_object_xy_distance 不焊住）"
+                 % (bb.ZMin, a, bb.ZMin, D.TOP_HOOK_D))
         z_open_top = D.PCIE_Z1 + D.PCIE_LIFT
-        (fail if pt_inside(rear, centers[0], y_wall, z_open_top - 0.5) else ok)(
+        (fail if pt_inside(chassis, centers[0], y_wall, z_open_top - 0.5) else ok)(
             f"opening top = bracket+{D.PCIE_LIFT:.2f} >= engage {D.PCIE_ENGAGE:.2f}"
         )
         for i, cx in enumerate(centers):
-            (fail if pt_inside(rear, cx, y_wall, z_open_mid) else ok)(f"PCIe void {i}")
+            (fail if pt_inside(chassis, cx, y_wall, z_open_mid) else ok)(f"PCIe void {i}")
             tz = (D.PCIE_TANG_Z0 + D.PCIE_Z0) / 2
             y_pocket = D.CASE_REAR + D.WALL - D.PCIE_TANG_POCKET / 2
             y_back = D.CASE_REAR + (D.WALL - D.PCIE_TANG_POCKET) / 2
-            if pt_inside(rear, cx, y_pocket, tz):
+            if pt_inside(chassis, cx, y_pocket, tz):
                 fail(f"PCIe tang pocket {i} still solid")
-            elif not pt_inside(rear, cx, y_back, tz):
+            elif not pt_inside(chassis, cx, y_back, tz):
                 fail(f"PCIe tang pocket {i} cut through — no Y datum for the bracket")
             else:
                 ok(f"PCIe tang pocket {i} blind (floor+back present)")
@@ -765,45 +983,88 @@ def main():
             (ok if D.PCIE_BAR_TAB_W <= D.PCIE_OPEN_W else fail)(
                 f"壓舌寬 {D.PCIE_BAR_TAB_W:.2f} <= 開孔寬 {D.PCIE_OPEN_W}"
             )
-    # ── keyhole：壓上去 → 落下 PCIE_BAR_DROP → 頭被窄段扣住 ──────────
-    # ★ 這一段的存在理由是結構，不是機構：舊的「沿 X 滑入 T 軌」逼出了連續橫縫。
-    #   T 軌參數必須整組消失，否則下一輪會被當成「漏掉的功能」加回來。
-    for g in ("PCIE_RAIL_Z0", "PCIE_RAIL_NECK_H", "PCIE_RAIL_HEAD_H",
-              "PCIE_RAIL_NECK_D", "PCIE_RAIL_HEAD_D", "PCIE_BAR_BOSS_W"):
+    # ── 壓條鎖固：繫樑頂面的印製盲內牙 + 沿用 MB_Screw（第十三輪）──────
+    for g in (
+        "PCIE_HOOK_NECK_W", "PCIE_HOOK_HEAD_W", "PCIE_HOOK_NECK_D",
+        "PCIE_HOOK_HEAD_D", "PCIE_BAR_DROP", "PCIE_BAR_FIT",
+        "PCIE_RAIL_Z0", "PCIE_RAIL_NECK_H", "PCIE_RAIL_HEAD_H",
+        # ★ 第十三輪退役：橫向 Ø2.8 盲 pilot + #6-32 自攻（保持力靠塑膠咬鋼牙，
+        #   而且孔軸沿 Y ⇒ 列印時是水平孔，牙谷上半必塌）。
+        "PCIE_LOCK_BOSS_W", "PCIE_LOCK_BOSS_H", "PCIE_LOCK_BOSS_D",
+        "PCIE_LOCK_PILOT_D", "PCIE_LOCK_PILOT_DEPTH", "PCIE_LOCK_CLEAR_D",
+        "PCIE_LOCK_SCREW_LEN", "PCIE_LOCK_SCREW_ENGAGE",
+        "PCIE_LOCK_SCREW_HEAD_D", "PCIE_LOCK_SCREW_HEAD_H",
+    ):
         if hasattr(D, g):
-            fail(f"舊 T 軌／內凸座參數還在：{g}")
-    ok("T 軌與內凸座的參數已整組刪除（壓條改 keyhole，不再沿 X 滑）")
-    hn, drop, f_bar = D.PCIE_HOOK_H, D.PCIE_BAR_DROP, D.PCIE_BAR_FIT
-    # 幾何推導：頭要能在「抬起」時穿過寬口、在「落下」時被窄段擋住 → 落差 ≥ 頭高
-    (ok if drop >= hn else fail)(f"keyhole 落差 {drop} >= 頭高 {hn}（否則寬口與窄段在同一個 Z 上矛盾）")
-    # 抬起解鎖時四個壓舌也跟著上去，不能頂到開孔頂
-    (ok if D.PCIE_BAR_Z1 + drop <= D.PCIE_Z1 + D.PCIE_LIFT else fail)(
-        f"解鎖抬起後壓舌頂 {D.PCIE_BAR_Z1 + drop:.2f} <= 開孔頂 {D.PCIE_Z1 + D.PCIE_LIFT:.2f}"
+            fail(f"退役 keyhole／自攻 pilot 參數仍存在：{g}")
+    mount_y = D.pcie_bar_mount_y()
+    ribs = D.pcie_rib_x()
+    (ok if approx(D.PCIE_BAR_SEAT_T, D.PCB_T, 1e-6) else fail)(
+        f"壓條鎖點剩厚 {D.PCIE_BAR_SEAT_T:.2f} = PCB_T {D.PCB_T}"
+        f"（夾持厚相同 ⇒ 螺絲沿用 MB_Screw，不新增第九種 STL）"
     )
-    (ok if approx(D.PCIE_LIFT, max(D.PCIE_ENGAGE + 1.5,
-                                   D.PCIE_HOLD_GAP + D.PCIE_BAR_TAB_H + drop + 0.6), 1e-6) else fail)(
-        f"抬升帶 {D.PCIE_LIFT:.2f} 由「卡的指入深度」與「壓條解鎖行程」取大者導出"
+    (ok if D.PCIE_BAR_CBORE_D >= D.MB_SCREW_HEAD_D else fail)(
+        f"沉頭凹 Ø{D.PCIE_BAR_CBORE_D:.2f} >= 六角頭外接圓 Ø{D.MB_SCREW_HEAD_D:.2f}"
     )
-    (ok if approx(D.PCIE_HOOK_NECK_D - D.PCIE_HOOK_FUSE - D.PCIE_BAR_T, f_bar, 1e-6) else fail)(
-        f"頭的內面到牆 {D.PCIE_HOOK_NECK_D - D.PCIE_HOOK_FUSE:.2f} = 壓條厚 + 滑配 {f_bar}"
+    (ok if D.PCIE_BAR_T - D.PCIE_BAR_SEAT_T >= D.MB_SCREW_HEAD_H else fail)(
+        f"沉頭凹深 {D.PCIE_BAR_T - D.PCIE_BAR_SEAT_T:.2f} >= 頭高 {D.MB_SCREW_HEAD_H}"
+        f"（螺絲頭不凸出壓條 ⇒ 後凸比舊版少一個頭高）"
     )
-    (ok if D.PCIE_HOOK_HEAD_W > D.PCIE_HOOK_NECK_W + 2 * (f_bar + 1.0) else fail)(
-        f"頭寬 {D.PCIE_HOOK_HEAD_W} 比窄槽 {D.PCIE_HOOK_NECK_W + 2 * f_bar:.2f} 多出"
-        f" {(D.PCIE_HOOK_HEAD_W - D.PCIE_HOOK_NECK_W) / 2 - f_bar:.2f}/邊 的扣料"
+    socket_left = (D.CASE_REAR + D.WALL) - D.pcie_lock_socket_end()
+    (ok if socket_left >= 0.8 else fail)(
+        f"盲牙盲端到後牆內面剩 {socket_left:.2f} >= 0.80（沒有打穿到內腔）"
     )
-    if rear is not None:
-        for i, hx in enumerate(D.pcie_hook_x()):
-            zc = D.PCIE_HOOK_Z0 + D.PCIE_HOOK_H / 2
-            (ok if pt_inside(rear, hx, D.CASE_REAR - D.PCIE_HOOK_NECK_D / 2, zc, 0.02) else fail)(
-                f"蘑菇柱 {i} 的頸實心"
+    tie_side = (D.PCIE_TIE_H - D.MB_THREAD_MAJOR) / 2
+    (ok if tie_side >= 0.8 else fail)(
+        f"盲牙在 Z 向的孔壁 {tie_side:.2f} >= 0.80（繫樑高 {D.PCIE_TIE_H}）"
+    )
+    (ok if D.PCIE_TIE_Z0 < D.PCIE_LOCK_Z < D.PCIE_TIE_Z1 else fail)(
+        f"盲牙軸 z={D.PCIE_LOCK_Z:.2f} 落在繫樑 {D.PCIE_TIE_Z0:.2f}…{D.PCIE_TIE_Z1:.2f} 之間"
+    )
+    (ok if set(D.pcie_lock_x()) == {ribs[0], ribs[-1]} else fail)(
+        f"兩個鎖點在最外兩根槽間肋的正上方 {[round(x, 2) for x in D.pcie_lock_x()]}"
+        f"（拉力回到肋的上端固定端，硬規則 20）"
+    )
+    if chassis is not None:
+        bad = []
+        for i, hx in enumerate(D.pcie_lock_x()):
+            placed = B.place_pcie_lock_screw(B.make_mb_screw(), hx)
+            v = common_vol(placed, chassis)
+            if v > INTERFERE_MAX:
+                bad.append(f"{i}:{v:.1f}")
+            (ok if pt_inside(chassis, hx, D.pcie_lock_socket_end() + 0.3,
+                             D.PCIE_LOCK_Z, 0.02) else fail)(
+                f"壓條鎖點 {i} 是盲孔（盲端外仍有料）"
             )
-            (ok if pt_inside(rear, hx + D.PCIE_HOOK_HEAD_W / 2 - 0.5,
-                             D.CASE_REAR - D.PCIE_HOOK_NECK_D - D.PCIE_HOOK_HEAD_D / 2, zc, 0.02)
-             else fail)(f"蘑菇柱 {i} 的頭（翼）實心")
-            # 柱必須落在開孔頂之上的全寬實料帶，否則它自己就懸在開孔上
-            (ok if D.PCIE_HOOK_Z0 >= D.PCIE_Z1 + D.PCIE_LIFT else fail)(
-                f"蘑菇柱 {i} 柱底 {D.PCIE_HOOK_Z0:.2f} >= 開孔頂 {D.PCIE_Z1 + D.PCIE_LIFT:.2f}"
+            (fail if pt_inside(chassis, hx, mount_y + 0.3, D.PCIE_LOCK_Z, 0.02) else ok)(
+                f"壓條鎖點 {i} 自補強層外表面開通"
             )
+        (fail if bad else ok)(
+            f"壓條螺絲 {'工作相位撞 Chassis：' + str(bad) if bad else '兩顆皆可旋入'}"
+        )
+        hx = D.pcie_lock_x()[0]
+        turned = B.place_pcie_lock_screw(B.make_mb_screw(), hx)
+        turned.rotate(App.Vector(hx, 0, D.PCIE_LOCK_Z), App.Vector(0, 1, 0), 180.0)
+        pv = common_vol(turned, chassis)
+        (ok if pv > INTERFERE_MAX else fail)(
+            f"壓條盲牙是真螺旋：相位轉 180° 撞 {pv:.1f} mm³"
+            if pv > INTERFERE_MAX else
+            f"壓條盲牙相位轉 180° 只撞 {pv:.2f} mm³——疑似軸對稱假牙"
+        )
+    if bar is not None:
+        for i, hx in enumerate(D.pcie_lock_x()):
+            (fail if pt_inside(bar, hx, mount_y - D.PCIE_BAR_SEAT_T / 2,
+                               D.PCIE_LOCK_Z, 0.02) else ok)(
+                f"壓條鎖點 {i} 通孔貫穿"
+            )
+            (ok if pt_inside(bar, hx + D.PCIE_BAR_CBORE_D / 2 + 0.8,
+                             mount_y - D.PCIE_BAR_T + 0.3, D.PCIE_LOCK_Z, 0.02) else fail)(
+                f"壓條鎖點 {i} 沉頭凹外側仍有料"
+            )
+    if chassis is not None and bar is not None:
+        (ok if common_vol(chassis, bar) <= INTERFERE_MAX else fail)(
+            f"Chassis/PCIeBar 定位後不重疊 {common_vol(chassis, bar):.2f} mm³"
+        )
     (ok if D.psu_slide_room() >= D.PSU_SLIDE_X else fail)(
         f"電源落入橫移空間 {D.psu_slide_room():.2f} >= 需求 {D.PSU_SLIDE_X}"
     )
@@ -894,6 +1155,67 @@ def main():
         (ok if D.RACK_RAIL_Z0 > D.tray_z0(D.HDD_LEVELS - 1) + D.TRAY_RAIL_H else fail)(
             "側舌不落在任何一層托盤導軌槽的 Z 帶裡（舌根有整厚立板）"
         )
+
+    # ── 碟架承托肩（第十三輪；使用者：側板對應的溝槽太淺）─────────────
+    log("--- 碟架承托肩 ---")
+    old_area = 4 * D.RACK_BEAM_W * (D.RACK_RAIL_T - D.SLIDE_FIT)
+    new_area = 2 * len(D.RACK_BEAM_Y) * D.RACK_BEAM_W * D.RACK_LEDGE_D
+    (ok if new_area >= 10 * old_area else fail)(
+        f"承重面積 {old_area:.0f} → {new_area:.0f} mm²（×{new_area / old_area:.0f}）"
+        f"：從 {D.RACK_RAIL_T - D.SLIDE_FIT:.2f} mm 咬合改成坐在 {D.RACK_LEDGE_D} mm 肩上"
+    )
+    (ok if approx(D.RACK_LEDGE_Z1, D.RACK_RAIL_Z0 - D.SLIDE_FIT, 1e-6) else fail)(
+        f"肩頂 {D.RACK_LEDGE_Z1:.2f} = 橫樑底 {D.RACK_RAIL_Z0:.2f} − 滑配"
+        f"（滑入不磨、載重落 {D.SLIDE_FIT} 就坐實；硬規則 19）"
+    )
+    (ok if approx(D.RACK_LEDGE_GUSSET, D.RACK_LEDGE_D + D.CHASSIS_OVERLAP, 1e-6) else fail)(
+        f"斜撐 45°：高 {D.RACK_LEDGE_GUSSET:.2f} = 伸出 {D.RACK_LEDGE_D} + 埋入 "
+        f"{D.CHASSIS_OVERLAP}（自根部量起才是 45°，Chassis 地板貼床時自撐）"
+    )
+    ledge_bottom = D.RACK_LEDGE_Z0 - D.RACK_LEDGE_GUSSET
+    (ok if ledge_bottom > max(D.AREA_A_TOP_Z, D.AREA_B_TOP_Z, D.AREA_C_TOP_Z) else fail)(
+        f"肩底 {ledge_bottom:.2f} 高過三個規格淨空頂（A {D.AREA_A_TOP_Z:.2f}／"
+        f"B {D.AREA_B_TOP_Z:.2f}／C {D.AREA_C_TOP_Z:.2f}）"
+    )
+    (ok if D.RACK_LEDGE_Y0 > D.ATX_Y1 else fail)(
+        f"Chassis 段的肩自 y={D.RACK_LEDGE_Y0:.2f} 起，讓開電源前緣 {D.ATX_Y1:.2f}"
+    )
+    (ok if D.RACK_LEDGE_Y1 <= D.SHROUD_Y0 - D.SHROUD_LAP + 1e-9 else fail)(
+        f"Chassis 段的肩止於 {D.RACK_LEDGE_Y1:.2f}，讓開前罩搭接帶（內壁要進來）"
+    )
+    (ok if D.SHROUD_LEDGE_Y0 >= D.SHROUD_Y0 else fail)(
+        f"前罩段的肩自 {D.SHROUD_LEDGE_Y0:.2f} 起（Chassis 牆前端面 {D.SHROUD_Y0:.2f} 之外）"
+    )
+    cantilever = D.HDD_Y1 - max(D.RACK_BEAM_Y)
+    (ok if cantilever < 0.5 * (D.HDD_Y1 - D.BAY_SPLIT_Y) else fail)(
+        f"碟架前段懸臂 {D.HDD_Y1 - D.BAY_SPLIT_Y:.2f} → {cantilever:.2f} mm"
+        f"（第三根樑坐在前罩承托肩上）"
+    )
+    (ok if len(D.RACK_RAIL_BEAM_Y) == len(D.RACK_BEAM_Y) - 1 else fail)(
+        f"側舌只長在 Chassis 槽 y 帶內的 {len(D.RACK_RAIL_BEAM_Y)} 根樑上"
+        f"（第三根在前罩段，那裡沒有牆槽）"
+    )
+    if chassis is not None:
+        ym = (D.RACK_LEDGE_Y0 + D.RACK_LEDGE_Y1) / 2
+        for tag, xs in (
+            ("左", D.CASE_LEFT + D.WALL + D.RACK_LEDGE_D / 2),
+            ("右", D.CASE_RIGHT - D.WALL - D.RACK_LEDGE_D / 2),
+        ):
+            (ok if pt_inside(chassis, xs, ym, D.RACK_LEDGE_Z1 - 0.5, 0.02) else fail)(
+                f"Chassis {tag}肩實心（x={xs:.2f}, z={D.RACK_LEDGE_Z1 - 0.5:.2f}）"
+            )
+            (fail if pt_inside(chassis, xs, ym, D.RACK_LEDGE_Z1 + 0.15, 0.02) else ok)(
+                f"Chassis {tag}肩頂面之上是空的（橫樑坐得下去）"
+            )
+    if shroud is not None:
+        ym = (D.SHROUD_LEDGE_Y0 + D.SHROUD_LEDGE_Y1) / 2
+        for tag, xs in (
+            ("左", D.CASE_LEFT + D.SHROUD_WALL + D.SHROUD_LEDGE_D / 2),
+            ("右", D.CASE_RIGHT - D.SHROUD_WALL - D.SHROUD_LEDGE_D / 2),
+        ):
+            (ok if pt_inside(shroud, xs, ym, D.RACK_LEDGE_Z1 - 0.5, 0.02) else fail)(
+                f"前罩 {tag}肩實心（碟架第三根樑坐在它上面）"
+            )
     # 應支援卡長由碟架後緣導出，且仍 >= CEM 半長卡
     (ok if approx(D.PCIE_CARD_LEN, D.TRAY_Y0 - (D.CASE_REAR + D.WALL) - 2.0, 1e-6) else fail)(
         f"應支援卡長 {D.PCIE_CARD_LEN:.2f} 由碟架後緣 {D.TRAY_Y0:.2f} 導出"
@@ -936,761 +1258,548 @@ def main():
         zz = D.tray_z0(0) + 8.0 + D.FRONT_VENT_SLAT / 2
         (fail if pt_inside(dtray, -130.0, D.HDD_Y1 + D.TRAY_FRONT_GAP + D.TRAY_FACE_T / 2, zz)
          else ok)("碟托盤前擋板的進氣柵確實開了")
-    if tray is not None:
+    if chassis is not None:
         # 地板不得再開電源進氣柵：電源已經不在底下了（多餘孔洞）
         solid = all(
-            pt_inside(tray, x, y, D.FLOOR_T / 2, 0.02)
+            pt_inside(chassis, x, y, D.FLOOR_T / 2, 0.02)
             for x, y in ((-138.0, 40.0), (-138.0, 100.0), (-60.0, 70.0))
         )
         (ok if solid else fail)("底板無進氣柵（電源已上置；地板是密封的）")
     for name, sh, x, y in (
-        ("Side_Left_MB", side_l, D.CASE_LEFT + D.WALL / 2, 60.0),
-        ("Side_Right_MB", side_r, D.CASE_RIGHT - D.WALL / 2, 60.0),
+        ("Chassis 左牆", chassis, D.CASE_LEFT + D.WALL / 2, 60.0),
+        ("Chassis 右牆", chassis, D.CASE_RIGHT - D.WALL / 2, 60.0),
     ):
         if sh is None:
             continue
         solid = all(pt_inside(sh, x, y, z, 0.02) for z in (40.0, 120.0, 170.0))
         (ok if solid else fail)(f"{name} 無通風開孔（氣流只有一條：前柵→碟→內腔→電源）")
 
-    # ── 全滑槽組裝：**一顆機殼螺絲都沒有**（使用者要求）──────────────
-    log("--- 滑槽組裝（無螺絲）---")
-    for g in ("M3_CLR", "M3_TAP", "M3_INSERT_D", "M3_INSERT_L", "M3_BOSS_L", "M3_BOSS_W",
-              "M3_BASE_Z", "M3_REAR_BASE_X", "M3_SIDE_BASE_Y", "M3_CAGE_Y", "M3_CAGE_Z",
-              "TOP_SCREW_BOSS_D", "TOP_SCREW_MB_Y", "TOP_SCREW_HDD_Y",
-              "CAGE_LAP_W", "CAGE_LAP_Z0", "TOP_SEAM_Y", "TOP_LAP_W"):
-        if hasattr(D, g):
-            fail(f"螺絲／銅母／搭接片的參數還在：{g}")
-    ok("M3 銅母、頂蓋螺絲座、碟艙搭接片的參數已整組刪除")
-    # 幾何斷言：機殼件上不得再有 Ø2.5–Ø4.6 的圓柱孔（銅母／通孔的特徵尺寸）。
-    # 探法：在舊螺絲位置取樣，全部必須是實料或空氣，而不是「孔」。
-    if tray is not None:
-        solid = all(pt_inside(tray, x, y, D.FLOOR_T / 2, 0.02)
-                    for x, y in ((-140.0, D.FLOOR_Y0 + 6.0), (0.0, D.FLOOR_Y0 + 6.0)))
-        (ok if solid else fail)("底板後緣舊螺母座位置現在是實心地板（座已刪）")
-    for nm, sh in (("Side_Left_MB", side_l), ("Side_Right_MB", side_r)):
-        if sh is None:
-            continue
-        xw = D.CASE_LEFT + D.WALL / 2 if nm.endswith("Left_MB") else D.CASE_RIGHT - D.WALL / 2
-        solid = all(pt_inside(sh, xw, y, 30.0, 0.02) for y in (30.0, 190.0))
-        (ok if solid else fail)(f"{nm} 舊 M3 通孔位置現在是實心牆")
+    # ── 一體式 Chassis／可拆件接合 ───────────────────────────────────
+    log("--- 一體式 Chassis／可拆件接合 ---")
+    retired = (
+        "FLOOR_LIP", "FLOOR_LIP_T", "FLOOR_LEDGE_T", "FLOOR_DETENT_R",
+        "FLOOR_DETENT_DEPTH", "FLOOR_REAR_DETENT_R", "REAR_TAB_D",
+        "REAR_TAB_T", "REAR_WEDGE_H", "REAR_DETENT_Z", "PCIE_BAR_DROP",
+        "PCIE_HOOK_NECK_W", "PCIE_HOOK_HEAD_W", "MB_NUT_OD", "MB_STUD_MAJOR",
+    )
+    stale = [name for name in retired if hasattr(D, name)]
+    (fail if stale else ok)(
+        f"{'退役接合參數仍存在：' + ', '.join(stale) if stale else '四件 Chassis 舊滑槽／舌／楔／keyhole 參數已刪除'}"
+    )
+    if chassis is not None:
+        o = D.CHASSIS_OVERLAP
+        roots = (
+            ("地板／左牆", D.FLOOR_X0 - o / 2, 80.0, D.FLOOR_T / 2),
+            ("地板／右牆", D.FLOOR_X1 + o / 2, 80.0, D.FLOOR_T / 2),
+            ("地板／後牆", 0.0, D.FLOOR_Y0 - o / 2, D.FLOOR_T / 2),
+            ("左牆／後牆", D.CASE_LEFT + D.WALL / 2,
+             D.CASE_REAR + D.WALL - o / 2, 90.0),
+            ("右牆／後牆", D.CASE_RIGHT - D.WALL / 2,
+             D.CASE_REAR + D.WALL - o / 2, 90.0),
+        )
+        for tag, x, y, z in roots:
+            (ok if pt_inside(chassis, x, y, z, 0.02) else fail)(
+                f"Chassis {tag} 根部有 {o:.2f} mm 體積重疊"
+            )
+        bb = obb(chassis)
+        want_y = D.BAY_SPLIT_Y - (D.CASE_REAR - D.PCIE_RIB_D)
+        (ok if approx(bb.XLength, D.CASE_W, 0.05)
+         and approx(bb.YLength, want_y, 0.05)
+         and approx(bb.ZLength, D.OUTER_TOP_Z, 0.05) else fail)(
+            f"Chassis 實際 OBB {bb.XLength:.2f}×{bb.YLength:.2f}×{bb.ZLength:.2f} mm"
+            f" = {D.CASE_W:.2f}×{want_y:.2f}×{D.OUTER_TOP_Z:.2f}"
+        )
+        (ok if max(bb.XLength, bb.YLength, bb.ZLength) <= D.A1_MAX else fail)(
+            f"Chassis 裸件可放入 A1：最大邊 {max(bb.XLength, bb.YLength, bb.ZLength):.2f} <= {D.A1_MAX:.0f}"
+        )
 
-    # 滑槽本身：每一道都要「槽是空的、槽外還有牆料」（挖穿就沒有定位面了）
-    for nm, sh, xi, sgn in (
-        ("Side_Left_MB", side_l, D.CASE_LEFT + D.WALL, -1),
-        ("Side_Right_MB", side_r, D.CASE_RIGHT - D.WALL, +1),
-    ):
-        if sh is None:
-            continue
-        ym = (D.CASE_REAR + D.WALL + D.BAY_SPLIT_Y) / 2
-        z_floor_groove = D.FLOOR_T - D.FLOOR_LIP_T / 2
-        for tag, zc, depth, yc in (
-            ("底板舌槽", z_floor_groove, D.FLOOR_LIP + D.SLIDE_FIT, ym),
-            ("碟架舌槽", (D.RACK_RAIL_Z0 + D.RACK_RAIL_Z1) / 2, D.RACK_RAIL_T, D.BAY_SPLIT_Y - 20),
-            ("頂蓋舌槽", D.INNER_TOP_Z - D.TOP_T / 2, D.TOP_LIP + D.SLIDE_FIT, ym),
-        ):
-            x_in = xi + sgn * depth / 2  # 槽中間
-            x_out = xi + sgn * (depth + (D.WALL - depth) / 2)  # 槽外的牆料
-            (fail if pt_inside(sh, x_in, yc, zc, 0.02) else ok)(f"{nm} {tag}開通")
-            (ok if pt_inside(sh, x_out, yc, zc, 0.02) else fail)(f"{nm} {tag}沒有挖穿（背後仍有牆料）")
-        # ★ 使用者主訴 4：「底板跟左右板之間真的有滑蓋設計嗎」
-        #   第八輪答案是「不是」：槽開穿到牆底，槽的**下方沒有任何料**（探針 0.00 mm³），
-        #   那是 L 形搭邊。滑槽的定義是**上下都夾得住**，所以兩邊都要驗。
-        x_mid = xi + sgn * (D.FLOOR_LIP + D.SLIDE_FIT) / 2
-        (ok if pt_inside(sh, x_mid, ym, D.FLOOR_LEDGE_T / 2, 0.02) else fail)(
-            f"{nm} 底板槽**下方**有整厚牆料當承載唇（高 {D.FLOOR_LEDGE_T:.2f}）"
+    # Rack 最底層承托格柵：三橫樑的兩端與中央、中央縱樑的全長都必須有料。
+    log("--- HDD Rack 底部承托格柵 ---")
+    (ok if len(D.RACK_BASE_BEAM_Y) == 3 else fail)(
+        f"Rack 底部橫樑 {len(D.RACK_BASE_BEAM_Y)}/3"
+    )
+    (ok if approx(D.RACK_BASE_Z1, D.HDD_Z0 - D.SLIDE_FIT, 1e-9) else fail)(
+        f"格柵頂 {D.RACK_BASE_Z1:.2f} = lv0 托盤底 {D.HDD_Z0:.2f} − 滑配 {D.SLIDE_FIT:.2f}"
+    )
+    (ok if D.RACK_BASE_Z1 - D.RACK_Z0 >= 0.8 else fail)(
+        f"格柵厚 {D.RACK_BASE_Z1 - D.RACK_Z0:.2f} >= 0.8 mm"
+    )
+    if rack is not None:
+        zc = (D.RACK_Z0 + D.RACK_BASE_Z1) / 2
+        for i, by in enumerate(D.RACK_BASE_BEAM_Y):
+            for tag, x in (
+                ("左根", D.RACK_X0 + 0.5),
+                ("中央", D.RACK_BASE_SPINE_X),
+                ("右根", D.RACK_POST_X1 - 0.5),
+            ):
+                (ok if pt_inside(rack, x, by, zc, 0.02) else fail)(
+                    f"格柵橫樑 {i} {tag}實心"
+                )
+        for i, y in enumerate((D.TRAY_Y0 + 0.5,
+                               (D.TRAY_Y0 + D.HDD_Y1) / 2,
+                               D.HDD_Y1 - 0.5)):
+            (ok if pt_inside(rack, D.RACK_BASE_SPINE_X, y, zc, 0.02) else fail)(
+                f"中央縱樑取樣 {i} 實心"
+            )
+        gap_z = D.RACK_BASE_Z1 + D.SLIDE_FIT / 2
+        (fail if pt_inside(rack, D.RACK_BASE_SPINE_X,
+                           D.RACK_BASE_BEAM_Y[1], gap_z, 0.02) else ok)(
+            f"格柵與 lv0 托盤之間 {D.SLIDE_FIT:.2f} mm 間隙開通"
         )
-        (ok if pt_inside(sh, x_mid, ym, D.FLOOR_T + D.SLIDE_FIT + 1.0, 0.02) else fail)(
-            f"{nm} 底板槽**上方**有牆料（舌抬不出去）"
+        t0 = B.make_hdd_tray_placed(0)
+        (ok if common_vol(rack, t0) <= INTERFERE_MAX else fail)(
+            f"格柵／lv0 托盤不干涉 {common_vol(rack, t0):.2f} mm³"
         )
-        # ★ 第十輪：槽挖完之後牆上必須還剩得下 GROOVE_BACK_MIN 的料
-        back = D.WALL - (D.FLOOR_LIP + D.SLIDE_FIT)
-        (ok if back >= D.GROOVE_BACK_MIN - 1e-9 else fail)(
-            f"{nm} 底板槽背後剩料 {back:.2f} >= 最小可印壁厚 {D.GROOVE_BACK_MIN}"
+
+    # Top：側舌咬合、後鉤、兩顆只在最後短行程作用的可拆 detent。
+    log("--- Top 側槽／後鉤／detent ---")
+    (ok if D.TOP_LIP >= 1.0 else fail)(f"Top 側舌咬合 {D.TOP_LIP:.2f} >= 1.0 mm")
+    (ok if D.WALL - (D.TOP_LIP + D.SLIDE_FIT) >= D.GROOVE_BACK_MIN - 1e-9 else fail)(
+        f"Top 槽背剩料 {D.WALL - D.TOP_LIP - D.SLIDE_FIT:.2f} >= {D.GROOVE_BACK_MIN:.2f} mm"
+    )
+    (ok if len(B.top_detents()) == len(D.TOP_DETENT_X) == 2 else fail)(
+        f"Top detent {len(B.top_detents())}/2"
+    )
+    (ok if D.TOP_DETENT_R >= 0.5 and 0 < D.TOP_DETENT_DEPTH < D.TOP_DETENT_R else fail)(
+        f"Top detent R={D.TOP_DETENT_R:.2f}、凸出={D.TOP_DETENT_DEPTH:.2f} 可印且可 cam-out"
+    )
+    if chassis is not None and top is not None:
+        ym = (D.FLOOR_Y0 + D.BAY_SPLIT_Y) / 2
+        (ok if pt_inside(top, D.FLOOR_X0 - D.TOP_LIP / 2, ym,
+                         D.INNER_TOP_Z - D.TOP_T / 2, 0.02) else fail)(
+            "Top 左側舌實心"
         )
-    # 底板三面舌 + 牆槽的配合
-    if tray is not None:
-        bb = obb(tray)
-        want_w = (D.FLOOR_X1 - D.FLOOR_X0) - 2 * D.SLIDE_FIT + 2 * D.FLOOR_LIP
-        (ok if approx(bb.XLength, want_w, 0.05) else fail)(
-            f"底板含兩側舌寬 {bb.XLength:.2f} = 內腔 − 2×滑配 + 2×舌 {D.FLOOR_LIP}"
+        (fail if pt_inside(chassis, D.FLOOR_X0 - D.TOP_LIP / 2, ym,
+                           D.INNER_TOP_Z - D.TOP_T / 2, 0.02) else ok)(
+            "Chassis 左側 Top 槽開通"
         )
-        # ★ 第十輪：本體側緣**內縮 SLIDE_FIT**。第九輪底板剛好等於內腔寬 247.88，
-        #   兩側與牆內面完全共面（distToShape 0.0000）→ 250 mm 跨距上裝不進去。
-        (fail if pt_inside(tray, D.FLOOR_X0 + D.SLIDE_FIT / 2, ym, D.FLOOR_T / 2, 0.02) else ok)(
-            f"底板本體左緣內縮 {D.SLIDE_FIT}（不與左內牆共面）"
-        )
-        (fail if pt_inside(tray, D.FLOOR_X1 - D.SLIDE_FIT / 2, ym, D.FLOOR_T / 2, 0.02) else ok)(
-            f"底板本體右緣內縮 {D.SLIDE_FIT}"
-        )
-        # 舌只有上半片：舌的 z 帶下方在底板本體以外必須是空的
-        x_tongue = D.FLOOR_X0 + D.SLIDE_FIT - D.FLOOR_LIP / 2
-        (fail if pt_inside(tray, x_tongue, ym, D.FLOOR_LEDGE_T / 2, 0.02) else ok)(
-            f"底板側舌只有上半片（z {D.FLOOR_T - D.FLOOR_LIP_T:.2f}..{D.FLOOR_T:.2f}）"
-        )
-        (ok if pt_inside(tray, x_tongue, ym, D.FLOOR_T - D.FLOOR_LIP_T / 2, 0.02) else fail)(
-            "底板側舌本身實心"
-        )
-        (ok if bb.XLength <= D.A1_MAX and bb.YLength <= D.A1_MAX else fail)(
-            f"底板 {bb.XLength:.1f}×{bb.YLength:.1f} 印得進 A1 {D.A1_MAX:.0f}"
-        )
-    # 後牆定位舌 + detent
-    if rear is not None and side_l is not None:
-        y_tab = D.CASE_REAR + D.WALL + D.REAR_TAB_D / 2
-        (ok if pt_inside(rear, D.CASE_LEFT + D.WALL - D.REAR_TAB_T / 2, y_tab, 90.0, 0.02) else fail)(
-            "後牆左端定位舌實心（長在側板牆體那一側，不是往機殼內）"
-        )
-        (fail if pt_inside(side_l, D.CASE_LEFT + D.WALL - D.REAR_TAB_T / 2, y_tab, 90.0, 0.02)
-         else ok)("左側板對應的定位舌槽開通")
-        (ok if D.DETENT_R >= 0.5 else fail)(f"detent 半球 R={D.DETENT_R} >= 最小可印特徵 0.5")
-        (ok if D.DETENT_R < D.REAR_TAB_D / 2 else fail)(
-            f"detent 半球 R={D.DETENT_R} < 定位舌深的一半 {D.REAR_TAB_D / 2}"
-        )
-    # 頂蓋：後端半搭接鑽進後牆鉤唇下方
-    top = shapes.get("Top_MB")
-    if top is not None and rear is not None:
-        (ok if approx(D.TOP_HOOK_T * 2, D.TOP_T, 0.01) else fail)(
-            f"鉤唇厚 {D.TOP_HOOK_T} = 頂蓋厚 {D.TOP_T} 的一半（半搭接）"
-        )
-        y_hook = D.CASE_REAR + D.WALL + D.TOP_HOOK_D / 2
-        (ok if pt_inside(rear, 0.0, y_hook, D.OUTER_TOP_Z - D.TOP_HOOK_T / 2, 0.02) else fail)(
-            "後牆頂鉤唇實心（頂蓋抬不起來 → 側板也抽不上去）"
-        )
-        (fail if pt_inside(top, 0.0, y_hook, D.OUTER_TOP_Z - D.TOP_HOOK_T / 2, 0.02) else ok)(
-            "頂蓋後端上半已讓開給鉤唇"
+        for i, det in enumerate(B.top_detents()):
+            vc, vt = common_vol(chassis, det), common_vol(top, det)
+            (ok if vc > 0.05 else fail)(f"Top detent {i} 公球與 Chassis 融合 {vc:.2f} mm³")
+            (ok if vt <= 0.05 else fail)(f"Top detent {i} 母坑已從 Top 切開 {vt:.2f} mm³")
+        y_hook = D.FLOOR_Y0 + D.TOP_HOOK_D / 2
+        (ok if pt_inside(chassis, 0.0, y_hook,
+                         D.OUTER_TOP_Z - D.TOP_HOOK_T / 2, 0.02) else fail)(
+            "Chassis 後鉤唇實心"
         )
         (ok if approx(D.RACK_TOP_GAP, D.SLIDE_FIT, 1e-9) else fail)(
-            f"碟架頂板 → 頂蓋底面留了 {D.RACK_TOP_GAP} 的間隙"
-            f"（第九輪 INNER_TOP_Z 直接取 RACK_TOP_Z1 → 兩面共面）"
+            f"Rack 頂板到 Top 留 {D.RACK_TOP_GAP:.2f} mm"
         )
-        (ok if approx(D.INNER_TOP_Z, max(D.ATX_Z1 + D.PSU_CLEAR_MIN,
-                                         D.PCIE_Z1 + D.PCIE_LIFT + D.PCIE_TIE_H,
-                                         D.RACK_TOP_Z1 + D.RACK_TOP_GAP,
-                                         D.AREA_A_TOP_Z), 1e-9) else fail)(
-            f"內頂 {D.INNER_TOP_Z:.2f} = max(電源+{D.PSU_CLEAR_MIN}, PCIe, 碟架+"
-            f"{D.RACK_TOP_GAP}, AreaA)（導出）"
+        # ★ 第十三輪：後牆的頂蓋槽（使用者：後牆好像沒有專門插頂蓋的卡槽）。
+        #   第十二輪後方只有鉤唇，它擋的是 +Z；−Y 那一格靠 detent 的摩擦。
+        (ok if approx(D.WALL - (D.TOP_REAR_LIP + D.SLIDE_FIT), D.GROOVE_BACK_MIN, 1e-6)
+         else fail)(
+            f"後牆頂蓋槽深 {D.TOP_REAR_LIP + D.SLIDE_FIT:.2f}，槽背留 "
+            f"{D.WALL - (D.TOP_REAR_LIP + D.SLIDE_FIT):.2f} = GROOVE_BACK_MIN"
         )
-        (ok if pt_inside(top, 0.0, y_hook, D.INNER_TOP_Z + D.TOP_HOOK_T / 2, 0.02) else fail)(
-            "頂蓋後端下半仍有料（真的鑽進鉤唇下方，不是整段切光）"
-        )
-    # ── 前罩：使用者主訴 2（底下是空的／貼合／「真的是卡槽卡住的嗎」）────────
-    if shroud is not None and side_l is not None and tray is not None:
-        y_lap = D.BAY_SPLIT_Y - D.SHROUD_LAP / 2
-        (fail if pt_inside(side_l, D.CASE_LEFT + D.SHROUD_LAP_T / 2, y_lap, 90.0, 0.02) else ok)(
-            "左側板前段外表面已減薄（讓前罩套上去）"
-        )
-        (ok if pt_inside(shroud, D.CASE_LEFT + D.SHROUD_LAP_T / 2, y_lap, 90.0, 0.02) else fail)(
-            "前罩的搭接薄殼填進那道減薄帶"
-        )
-        # ★ 不是「總厚等於 WALL」而是「留了滑配」。第八輪 nominal 零間隙 →
-        #   common=0.000 被讀成不干涉，其實是套不進去。
-        side_left_t = D.WALL - D.SHROUD_LAP_T - D.SLIDE_FIT
-        (ok if approx(D.SHROUD_LAP_T + D.SLIDE_FIT + side_left_t, D.WALL, 1e-6) else fail)(
-            f"搭接：前罩殼 {D.SHROUD_LAP_T} + 滑配 {D.SLIDE_FIT} + 側板剩 {side_left_t:.2f}"
-            f" = 牆厚 {D.WALL}（外表面齊平，而且**留了間隙**不是零）"
-        )
-        # ① 前罩底下不再是空的
-        for tag, x, y in (("左", -150.0, D.CASE_FRONT - 20.0), ("右", 20.0, D.CASE_FRONT - 20.0)):
-            (ok if pt_inside(shroud, x, y, D.FLOOR_T / 2, 0.02) else fail)(f"前罩{tag}側地板實心")
-        (ok if pt_inside(shroud, 0.0, D.SHROUD_Y0 - D.SHROUD_LAP / 2,
-                         D.FLOOR_T - D.SHROUD_FLOOR_LAP_T / 2, 0.02) else fail)(
-            "前罩地板舌壓在底板前緣的減薄帶上（底面半搭接）"
-        )
-        (fail if pt_inside(tray, 0.0, D.BAY_SPLIT_Y - D.SHROUD_LAP / 2,
-                           D.FLOOR_T - D.SHROUD_FLOOR_LAP_T / 2, 0.02) else ok)(
-            "底板前緣上半已讓開（給前罩地板舌）"
-        )
-        (ok if pt_inside(tray, 0.0, D.BAY_SPLIT_Y - D.SHROUD_LAP / 2,
-                         D.SHROUD_FLOOR_LAP_T / 2, 0.02) else fail)("底板前緣下半仍有料（半搭接）")
-        # ② 頂面半搭接
-        top_sh = shapes.get("Top_MB")
-        if top_sh is not None:
-            (fail if pt_inside(top_sh, 0.0, D.BAY_SPLIT_Y - D.SHROUD_LAP / 2,
-                               D.OUTER_TOP_Z - D.SHROUD_TOP_LAP_T / 2, 0.02) else ok)(
-                "頂蓋前段上表面已減薄（給前罩頂舌）"
+        y_slot = D.CASE_REAR + D.WALL - (D.TOP_REAR_LIP + D.SLIDE_FIT) / 2
+        y_tab = D.FLOOR_Y0 + D.TOP_FIT_GAP - D.TOP_REAR_LIP / 2
+        z_slot = D.INNER_TOP_Z - D.TOP_T / 2
+        bands = D.top_rear_tab_bands()
+        for i, (bx0, bx1) in enumerate(bands):
+            xm = (bx0 + bx1) / 2
+            (fail if pt_inside(chassis, xm, y_slot, z_slot, 0.02) else ok)(
+                f"後牆頂蓋槽 {i} 開通（x={xm:.2f}）"
             )
-            (ok if pt_inside(shroud, 0.0, D.SHROUD_Y0 - D.SHROUD_LAP / 2,
-                             D.OUTER_TOP_Z - D.SHROUD_TOP_LAP_T / 2, 0.02) else fail)(
-                "前罩頂舌填進那道減薄帶（頂面齊平）"
+            y_back = (D.CASE_REAR + D.WALL
+                      - (D.TOP_REAR_LIP + D.SLIDE_FIT) - D.GROOVE_BACK_MIN / 2)
+            (ok if pt_inside(chassis, xm, y_back, z_slot, 0.02) else fail)(
+                f"後牆頂蓋槽 {i} 的槽背仍有料（y={y_back:.2f}）"
             )
-        # ③ 真的卡住：detent
-        t_left = D.WALL - D.SHROUD_LAP_T - D.SLIDE_FIT
-        (ok if 2 * D.SHROUD_DETENT_R <= t_left + D.SHROUD_DETENT_DEPTH + 1e-9 else fail)(
-            f"前罩 detent 2R={2 * D.SHROUD_DETENT_R:.2f} <= 減薄後料厚 {t_left:.2f}"
-            f" + 凸出 {D.SHROUD_DETENT_DEPTH}（球不會從另一面戳出去）"
-        )
-        (ok if D.SHROUD_DETENT_R >= 0.5 else fail)(
-            f"前罩 detent R={D.SHROUD_DETENT_R} >= 最小可印特徵 0.5"
-        )
-        dz = D.SHROUD_DETENT_Z[0]
-        xb = D.CASE_LEFT + D.SHROUD_LAP_T + D.SLIDE_FIT - D.SHROUD_DETENT_DEPTH / 2
-        (ok if pt_inside(side_l, xb, y_lap, dz, 0.02) else fail)("左側板減薄帶上的 detent 凸半球實心")
-        (fail if pt_inside(shroud, xb, y_lap, dz, 0.02) else ok)("前罩搭接殼上有對應的 detent 凹坑")
-        # ★ 第十輪：搭接帶裡**三道滑槽的正後方不准減薄**。
-        #   牆 2.4：內面槽 1.6 + 外面減薄 1.5 = 3.1 > 2.4 → 那 12 mm 是被切穿的。
-        #   第八～九輪三道槽在搭接帶裡全都是通的，只是當時兩件的料剛好錯開，
-        #   布林一路綠。**「沒有干涉」不等於「牆還在」。**
-        keep = B.side_lap_keep_bands()
-        (ok if len(keep) >= 2 else fail)(f"側板搭接帶的 keep 帶 {len(keep)} 段（三道槽合併後）")
-        for nm2, sh2 in (("Side_Left_MB", side_l), ("Side_Right_MB", side_r)):
-            if sh2 is None:
-                continue
-            xo2 = (D.CASE_LEFT if nm2.endswith("Left_MB") else D.CASE_RIGHT)
-            inw = 1 if nm2.endswith("Left_MB") else -1
-            x_skin = xo2 + inw * (D.SHROUD_LAP_T / 2)  # 減薄帶會被挖掉的那層皮
-            for kz0, kz1 in keep:
-                zc = min(max((kz0 + kz1) / 2, 1.0), D.OUTER_TOP_Z - 1.0)
-                (ok if pt_inside(sh2, x_skin, y_lap, zc, 0.02) else fail)(
-                    f"{nm2} 搭接帶 z={zc:.1f} **未減薄**（槽背後還有牆料）"
-                )
-                (fail if pt_inside(shroud, x_skin, y_lap, zc, 0.02) else ok)(
-                    f"前罩搭接殼在 z={zc:.1f} 讓開（整厚料咬進這個缺口 → Z 向被扣住）"
-                )
-            # 三道槽在搭接帶裡都不准穿到外表面
-            for tag2, zg, dep in (
-                ("底板槽", D.FLOOR_T - D.FLOOR_LIP_T / 2, D.FLOOR_LIP + D.SLIDE_FIT),
-                ("碟架槽", (D.RACK_RAIL_Z0 + D.RACK_RAIL_Z1) / 2, D.RACK_RAIL_T),
-                ("頂蓋槽", D.INNER_TOP_Z - D.TOP_T / 2, D.TOP_LIP + D.SLIDE_FIT),
-            ):
-                # 槽是自**內面**往外挖的 → 剩下的牆料在靠**外面**那一側
-                x_back = xo2 + inw * (D.WALL - dep) / 2
-                (ok if pt_inside(sh2, x_back, y_lap, zg, 0.02) else fail)(
-                    f"{nm2} 搭接帶裡的{tag2}背後仍有牆料（沒有被減薄切穿）"
-                )
-        # ④ 打薄了，但沒薄到不能印
-        (ok if D.SHROUD_WALL < D.WALL else fail)(
-            f"前罩側牆／頂板 {D.SHROUD_WALL} < 機殼牆 {D.WALL}（使用者要求打薄）"
-        )
-        (ok if min(D.SHROUD_WALL, D.SHROUD_LAP_T,
-                   D.FLOOR_T - D.SHROUD_FLOOR_LAP_T - D.SLIDE_FIT) >= 0.8 else fail)(
-            f"前罩最薄處 {min(D.SHROUD_WALL, D.SHROUD_LAP_T, D.FLOOR_T - D.SHROUD_FLOOR_LAP_T - D.SLIDE_FIT):.2f}"
-            f" >= FDM 最小可印壁厚 0.8"
+            (ok if pt_inside(top, xm, y_tab, z_slot, 0.02) else fail)(
+                f"Top 後舌 {i} 實心（沿 −Y 插進槽裡，槽底面即止擋）"
+            )
+        # 後舌是整條路徑掃過去的：兩段都必須完全避開電源與碟架頂板的 x 帶
+        swept = []
+        for bx0, bx1 in bands:
+            if bx0 < D.ATX_X1 and bx1 > D.ATX_X0:
+                swept.append("電源")
+            if bx0 < D.RACK_POST_X1 and bx1 > D.RACK_X0:
+                swept.append("碟架頂板")
+        (fail if swept else ok)(
+            "後舌兩段讓開電源與碟架頂板（硬規則 22：掃的是路徑不是最終位置）"
+            if not swept else f"後舌會在滑入途中刮過 {set(swept)}"
         )
 
-    # ── 配合間隙：**「≤ 上限」的地方也要檢查「≥ 下限」**（硬規則 19）────────────
-    # ★ 第十輪整段新增。第九輪只修了前罩搭接與層節距兩處零間隙，量下去才發現
-    #   `distToShape(底板, 側板) = 0.0000`、後牆、頂蓋、側板↔後牆**全部一樣**——
-    #   同一個病長在整條互鎖鏈上，而 verify 從來沒有一條在問「配合面留了幾 mm」。
-    log("--- 配合間隙（每一道滑槽的四個面）---")
-    ym_fit = (D.CASE_REAR + D.WALL + D.BAY_SPLIT_Y) / 2
-    xl_edge = D.FLOOR_X0 + D.SLIDE_FIT
-    xl_tip = xl_edge - D.FLOOR_LIP
-    xr_edge = D.FLOOR_X1 - D.SLIDE_FIT
-    xr_tip = xr_edge + D.FLOOR_LIP
-    gaps = (
-        ("底板本體 ↔ 左內牆", D.FLOOR_X0 + D.SLIDE_FIT / 2, ym_fit, D.FLOOR_T / 2),
-        ("底板本體 ↔ 右內牆", D.FLOOR_X1 - D.SLIDE_FIT / 2, ym_fit, D.FLOOR_T / 2),
-        ("底板左舌尖 ↔ 槽底", xl_tip - D.SLIDE_FIT / 2, ym_fit, D.FLOOR_T - D.FLOOR_LIP_T / 2),
-        ("底板右舌尖 ↔ 槽底", xr_tip + D.SLIDE_FIT / 2, ym_fit, D.FLOOR_T - D.FLOOR_LIP_T / 2),
-        ("底板左舌下 ↔ 承載唇", xl_tip + D.FLOOR_LIP / 2, ym_fit,
-         D.FLOOR_LEDGE_T + D.SLIDE_FIT / 2),
-        ("底板左舌上 ↔ 槽頂", xl_tip + D.FLOOR_LIP / 2, ym_fit, D.FLOOR_T + D.SLIDE_FIT / 2),
-        ("頂蓋左舌尖 ↔ 槽底", D.FLOOR_X0 - D.TOP_LIP - D.SLIDE_FIT / 2, ym_fit,
-         D.INNER_TOP_Z - D.TOP_T / 2),
-        ("頂蓋左舌上 ↔ 槽頂", D.FLOOR_X0 - D.TOP_LIP / 2, ym_fit,
-         D.INNER_TOP_Z + D.SLIDE_FIT / 2),
-        ("後牆定位舌尖 ↔ 槽底", D.FLOOR_X0 - D.REAR_TAB_T - D.SLIDE_FIT / 2,
-         D.CASE_REAR + D.WALL + D.REAR_TAB_D / 2, 90.0),
-        ("底板後舌尖 ↔ 後牆槽底", -100.0,
-         D.FLOOR_Y0 - D.FLOOR_LIP - D.SLIDE_FIT / 2, D.FLOOR_T - D.FLOOR_LIP_T / 2),
-        # ★ 這兩條是第十輪自己補的檢查漏掉的：它們不在任何「配合面」上，
-        #   而是藏在 `INNER_TOP_Z = max(...)` 與「切深剛好等於鉤唇厚」裡。
-        ("碟架頂板 ↔ 頂蓋底面", -100.0, D.BAY_SPLIT_Y - 20.0,
-         D.RACK_TOP_Z1 + D.RACK_TOP_GAP / 2),
-        ("頂蓋後端 ↔ 後牆頂鉤唇底面", 0.0,
-         D.CASE_REAR + D.WALL + D.TOP_HOOK_D / 2, D.OUTER_TOP_Z - D.TOP_HOOK_T - D.SLIDE_FIT / 2),
+    # Front：14 mm 四面搭接、10 顆 detent、四個 45° 導入面。
+    log("--- Front 搭接／導入／detent ---")
+    (ok if approx(D.SHROUD_LAP, 14.0, 1e-9) else fail)(
+        f"Front 搭接深 {D.SHROUD_LAP:.2f} = 14.00 mm"
     )
-    for tag, gx, gy, gz in gaps:
-        who = occupant(gx, gy, gz)
+    (ok if approx(D.SHROUD_LEAD_IN, 1.0, 1e-9) else fail)(
+        f"Front 四邊導入長 {D.SHROUD_LEAD_IN:.2f} = 1.00 mm"
+    )
+    front_detents = (
+        B.shroud_detents(True) + B.shroud_detents(False)
+        + B.shroud_lap_detents(True) + B.shroud_lap_detents(False)
+    )
+    (ok if len(front_detents) == 10 else fail)(f"Front detent {len(front_detents)}/10")
+    if shroud is not None and chassis is not None and top is not None:
+        y0, lead = D.SHROUD_Y0 - D.SHROUD_LAP, D.SHROUD_LEAD_IN
+        probes = (
+            ("左", D.CASE_LEFT + D.SHROUD_LAP_T - 0.25, y0 + 0.25, 90.0,
+             D.CASE_LEFT + D.SHROUD_LAP_T - 0.25, y0 + 0.90, 90.0),
+            ("右", D.CASE_RIGHT - D.SHROUD_LAP_T + 0.25, y0 + 0.25, 90.0,
+             D.CASE_RIGHT - D.SHROUD_LAP_T + 0.25, y0 + 0.90, 90.0),
+            ("頂", 0.0, y0 + 0.25, D.OUTER_TOP_Z - D.SHROUD_TOP_LAP_T + 0.25,
+             0.0, y0 + 0.90, D.OUTER_TOP_Z - D.SHROUD_TOP_LAP_T + 0.25),
+            ("底", 0.0, y0 + 0.25,
+             D.FLOOR_T - D.SHROUD_FLOOR_LAP_T + D.SLIDE_FIT + 0.25,
+             0.0, y0 + 0.90,
+             D.FLOOR_T - D.SHROUD_FLOOR_LAP_T + D.SLIDE_FIT + 0.25),
+        )
+        for tag, xe, ye, ze, xs, ys, zs in probes:
+            empty = not pt_inside(shroud, xe, ye, ze, 0.02)
+            solid = pt_inside(shroud, xs, ys, zs, 0.02)
+            (ok if empty and solid else fail)(
+                f"Front {tag}緣 45° 導入面：前端切空、{lead:.1f} mm 後恢復實料"
+            )
+        for i, det in enumerate(B.shroud_detents(True) + B.shroud_detents(False)
+                                + B.shroud_lap_detents(False)):
+            (ok if common_vol(chassis, det) > 0.05 else fail)(
+                f"Front 公 detent {i} 與 Chassis 融合"
+            )
+            (ok if common_vol(shroud, det) <= 0.05 else fail)(
+                f"Front detent {i} 母坑已切開"
+            )
+        for i, det in enumerate(B.shroud_lap_detents(True)):
+            (ok if common_vol(top, det) > 0.05 else fail)(
+                f"Front 頂 detent {i} 與 Top 融合"
+            )
+            (ok if common_vol(shroud, det) <= 0.05 else fail)(
+                f"Front 頂 detent {i} 母坑已切開"
+            )
+        for bx0, bx1 in B.shroud_floor_stud_bands():
+            x = (bx0 + bx1) / 2
+            y = D.BAY_SPLIT_Y - D.SHROUD_LAP / 2
+            (ok if pt_inside(chassis, x, y, D.FLOOR_T - 0.3, 0.02) else fail)(
+                f"Chassis x={x:.2f} 保留整厚主板柱腳"
+            )
+            (fail if pt_inside(shroud, x, y, D.FLOOR_T - 0.3, 0.02) else ok)(
+                f"Front x={x:.2f} 對應讓位槽開通"
+            )
+        # ★ 第十三輪：搭接帶改 U 形雙壁夾持（使用者：改成有縫隙插進去、兩邊夾住）。
+        #   第十二輪只有外壁貼在牆的外面減薄帶上，牆的內面整片是光的。
+        y_lap = D.SHROUD_Y0 - D.SHROUD_LAP / 2
+        z_lap = (D.SHROUD_INNER_Z0 + D.SHROUD_INNER_Z1) / 2
+        for tag, xw, inward in (
+            ("左", D.CASE_LEFT + D.WALL, 1),
+            ("右", D.CASE_RIGHT - D.WALL, -1),
+        ):
+            x_out = xw - inward * (D.WALL - D.SHROUD_LAP_T / 2)  # 外壁中面
+            x_in = xw + inward * (D.SLIDE_FIT + D.SHROUD_INNER_T / 2)  # 內壁中面
+            (ok if pt_inside(shroud, x_out, y_lap, z_lap, 0.02) else fail)(
+                f"Front {tag}搭接**外**壁實心（x={x_out:.2f}）"
+            )
+            (ok if pt_inside(shroud, x_in, y_lap, z_lap, 0.02) else fail)(
+                f"Front {tag}搭接**內**壁實心（x={x_in:.2f}）—— 牆被兩片夾住，不是單邊靠著"
+            )
+            # 夾持縫的寬度就是牆厚 + 兩個滑配
+            # 牆在搭接帶被外面減薄了 SHROUD_LAP_T + SLIDE_FIT，探剩料的中間
+            x_wall = xw - inward * (D.WALL - D.SHROUD_LAP_T - D.SLIDE_FIT) / 2
+            (ok if pt_inside(chassis, x_wall, y_lap, z_lap, 0.02) else fail)(
+                f"Chassis {tag}牆仍整片落在 Front 的 U 形縫裡（x={x_wall:.2f}）"
+            )
+        (ok if approx(D.SHROUD_INNER_Z0, D.AREA_B_TOP_Z + D.SLIDE_FIT, 1e-6) else fail)(
+            f"內壁下限 {D.SHROUD_INNER_Z0:.2f} = Area B 淨空頂 + 滑配"
+            f"（右牆內面到主板右緣只有 {D.CASE_RIGHT - D.WALL - D.BOARD_RIGHT:.2f}）"
+        )
+        (ok if approx(D.SHROUD_INNER_Z1,
+                      D.RACK_LEDGE_Z0 - D.RACK_LEDGE_GUSSET - D.SLIDE_FIT, 1e-6)
+         else fail)(
+            f"內壁上限 {D.SHROUD_INNER_Z1:.2f} 讓開碟架承托肩的斜撐底 "
+            f"{D.RACK_LEDGE_Z0 - D.RACK_LEDGE_GUSSET:.2f}"
+        )
+        # 內壁若沒接回主體壁就是兩片自由飄浮的板（實測 Front_Shroud solids=3）
+        x_join = D.CASE_LEFT + (D.SHROUD_WALL + D.WALL + D.SLIDE_FIT + D.SHROUD_INNER_T) / 2
+        (ok if pt_inside(shroud, x_join, D.SHROUD_Y0 + D.SHROUD_INNER_JOIN / 2, z_lap, 0.02)
+         else fail)(f"Front 左內壁與主體壁之間的接合塊實心（x={x_join:.2f}）")
+
+    # 配合面不得共面：取樣每一道刻意的 SLIDE_FIT 空隙。
+    log("--- 配合間隙 ---")
+    gap_probes = (
+        ("Top 左舌尖／槽底", D.FLOOR_X0 - D.TOP_LIP - D.SLIDE_FIT / 2,
+         80.0, D.INNER_TOP_Z - D.TOP_T / 2),
+        ("Top 左舌／槽頂", D.FLOOR_X0 - D.TOP_LIP / 2,
+         80.0, D.INNER_TOP_Z + D.SLIDE_FIT / 2),
+        ("Rack／lv0 托盤", D.RACK_BASE_SPINE_X,
+         D.RACK_BASE_BEAM_Y[1], D.RACK_BASE_Z1 + D.SLIDE_FIT / 2),
+        ("Rack 頂板／Top", D.RACK_BASE_SPINE_X,
+         D.BAY_SPLIT_Y - 20.0, D.RACK_TOP_Z1 + D.RACK_TOP_GAP / 2),
+        ("Top 後肩／鉤唇", 0.0, D.FLOOR_Y0 + D.TOP_HOOK_D / 2,
+         D.OUTER_TOP_Z - D.TOP_HOOK_T - D.SLIDE_FIT / 2),
+    )
+    for tag, x, y, z in gap_probes:
+        who = occupant(x, y, z)
         (fail if who else ok)(
-            f"{tag} 的 {D.SLIDE_FIT} mm 滑配是空的{'' if not who else f'（被 {who} 佔住＝零間隙）'}"
+            f"{tag} 的 {D.SLIDE_FIT:.2f} mm 間隙開通"
+            + (f"（被 {who} 佔住）" if who else "")
         )
 
-    # ── 卡榫盤點：每一個機殼件之間的接合都要有「槽 + 保持力」──────────────
-    # ★ 硬規則 7：清單不准手列。這張表是 (件A, 件B, 槽的探點, detent 產生器)，
-    #   而 STL_NAMES 裡所有**結構件**都必須在表裡出現至少一次 —— 漏一件就 SystemExit。
-    log("--- 卡榫／保持力盤點 ---")
-    JOINTS = (
-        ("Bottom_Tray", "Side_Left_MB", lambda: B.floor_detents(True)),
-        ("Bottom_Tray", "Side_Right_MB", lambda: B.floor_detents(False)),
-        ("Bottom_Tray", "Rear_IO_PCIe", lambda: B.floor_rear_detents()),
-        ("Rear_IO_PCIe", "Side_Left_MB", lambda: B.rear_tab_detents(True)),
-        ("Rear_IO_PCIe", "Side_Right_MB", lambda: B.rear_tab_detents(False)),
-        ("Front_Shroud", "Side_Left_MB", lambda: B.shroud_detents(True)),
-        ("Front_Shroud", "Side_Right_MB", lambda: B.shroud_detents(False)),
-        ("Front_Shroud", "Top_MB", lambda: B.shroud_lap_detents(True)),
-        ("Front_Shroud", "Bottom_Tray", lambda: B.shroud_lap_detents(False)),
-    )
-    covered = {p for j in JOINTS for p in j[:2]}
-    need = {"Bottom_Tray", "Rear_IO_PCIe", "Side_Left_MB", "Side_Right_MB", "Top_MB",
-            "Front_Shroud"}
-    if not need <= covered:
-        raise SystemExit(f"卡榫盤點漏了機殼件：{sorted(need - covered)}")
-    for a, b, gen in JOINTS:
-        det = gen()
-        if not det:
-            fail(f"{a}/{b} 沒有任何 detent")
-            continue
-        # 公件必須真的長在其中一件上（體積相交），母件必須讓開（落到定位時不干涉）
-        va = sum(common_vol(shapes[a], d) for d in det) if a in shapes else 0.0
-        vb = sum(common_vol(shapes[b], d) for d in det) if b in shapes else 0.0
-        (ok if max(va, vb) > 0.05 else fail)(
-            f"{a}/{b} detent ×{len(det)} 公件實心（{max(va, vb):.2f} mm³）"
-        )
-        (ok if min(va, vb) <= 0.05 else fail)(
-            f"{a}/{b} 落到定位時 detent 不干涉（母件已讓開 {min(va, vb):.2f} mm³）"
-        )
-    # 底板↔側板的 bead：過盈行程必須是**最後一小段**，不是整條 244 mm
-    run = D.floor_detent_run_mm()
-    total = D.BAY_SPLIT_Y - D.FLOOR_Y0
-    (ok if run <= 0.2 * total else fail)(
-        f"底板 bead 的過盈行程 {run:.1f} mm <= 全程 {total:.1f} 的 20%（球長在底板後段，"
-        f"側板的槽自後端掃過來 → 只有最後這一段磨）"
-    )
-    (ok if D.FLOOR_DETENT_R >= 0.5 else fail)(f"底板 bead R={D.FLOOR_DETENT_R} >= 0.5 可印")
-    (ok if D.FLOOR_DETENT_DEPTH > D.SLIDE_FIT else fail)(
-        f"底板 bead 凸出 {D.FLOOR_DETENT_DEPTH} > 滑配 {D.SLIDE_FIT}"
-        f"（過盈 {D.FLOOR_DETENT_DEPTH - D.SLIDE_FIT:.2f}；否則它只是個裝飾）"
-    )
-    (ok if 2 * D.FLOOR_REAR_DETENT_R <= D.FLOOR_LIP_T + D.DETENT_DEPTH + 1e-9 else fail)(
-        f"底板後舌半球 2R={2 * D.FLOOR_REAR_DETENT_R:.2f} <= 舌厚 {D.FLOOR_LIP_T} + 凸出 "
-        f"{D.DETENT_DEPTH}（球不會從舌的另一面戳出去）"
-    )
-    # 頂蓋側舌真的咬進側板（第九輪只有 0.40 mm）
-    if top is not None and side_l is not None:
-        eng = D.TOP_LIP
-        (ok if eng >= 1.0 else fail)(f"頂蓋側舌咬合量 {eng:.2f} >= 1.0（第九輪是 0.40）")
-        (ok if pt_inside(top, D.FLOOR_X0 - eng / 2, ym_fit, D.INNER_TOP_Z - D.TOP_T / 2, 0.02)
-         else fail)("頂蓋側舌真的伸進側板槽裡（不是只搭到槽口）")
-        (fail if pt_inside(side_l, D.FLOOR_X0 - eng / 2, ym_fit, D.INNER_TOP_Z - D.TOP_T / 2, 0.02)
-         else ok)("側板頂槽在同一點是空的")
-    # 後牆槽下方的承載唇（第九輪這裡是 0.00 mm³，只有側板被修好）
-    if rear is not None:
-        y_rg = D.CASE_REAR + D.WALL - D.FLOOR_LIP / 2
-        for xx in (-180.0, -60.0, 20.0):
-            (ok if pt_inside(rear, xx, y_rg, D.FLOOR_LEDGE_T / 2, 0.02) else fail)(
-                f"後牆底板槽下方有承載料 x={xx:.0f}（第九輪是 0.00 mm³）"
-            )
-            (ok if pt_inside(rear, xx, y_rg, D.FLOOR_T + D.SLIDE_FIT + 1.0, 0.02) else fail)(
-                f"後牆底板槽上方有牆料 x={xx:.0f}"
-            )
-
-    # ── 後牆的單向卡榫：直角面必須真的存在、而且朝著拉出的方向 ──────────
-    # 第十輪這裡是半球。半球受拉會**自己爬出來**，所以「有 detent」不等於「拉不出來」。
-    # 這條檢查問的是形狀：楔上必須有一個**法線平行 Y**的面，面積夠大，
-    # 而且它前方 SLIDE_FIT 內就是後牆的舌料（要頂住的那道邊）。
-    if rear is not None and side_l is not None:
-        y_sq = B.rear_wedge_y1()
-        want_a = D.DETENT_DEPTH * D.REAR_WEDGE_H * 0.8
-        for isl, nm in ((True, "左"), (False, "右")):
-            wedges = B.rear_tab_detents(isl)
-            (ok if len(wedges) == len(D.REAR_DETENT_Z) else fail)(
-                f"{nm}側楔 ×{len(wedges)}（＝REAR_DETENT_Z 的顆數）"
-            )
-            best = 0.0
-            for f in wedges[0].Faces:
-                u0, u1, v0, v1 = f.ParameterRange
-                n = f.normalAt((u0 + u1) / 2, (v0 + v1) / 2)
-                if abs(n.y) > 0.99 and abs(f.CenterOfMass.y - y_sq) < 0.05:
-                    best = max(best, f.Area)
-            (ok if best >= want_a else fail)(
-                f"{nm}側楔有法線平行 Y 的直角面 {best:.2f} >= {want_a:.2f} mm²"
-                f"（半球沒有這個面 → 受拉會 cam-out）"
-            )
-            xi = D.FLOOR_X0 if isl else D.FLOOR_X1
-            xp = xi + (-1 if isl else 1) * (D.REAR_TAB_T / 2)
-            zp = D.REAR_DETENT_Z[1]
-            (fail if pt_inside(rear, xp, y_sq - 0.3, zp, 0.02) else ok)(
-                f"{nm}側直角面後方是缺口（楔佔著）"
-            )
-            (ok if pt_inside(rear, xp, y_sq + D.SLIDE_FIT, zp, 0.02) else fail)(
-                f"{nm}側直角面前方 {D.SLIDE_FIT} 就是舌料（頂住它的那道邊）"
-            )
-            # 缺口自舌根開，前緣後面必須一路連到舌尖：中間開孔的話前緣只有一片細肉
-            (ok if pt_inside(rear, xp, D.CASE_REAR + D.WALL + D.REAR_TAB_D - 0.2, zp, 0.02)
-             else fail)(f"{nm}側缺口前緣一路連到舌尖（不是舌中間挖孔）")
-
-    # ── 保持力真相表：每一件在六個方向能自由走多遠 ─────────────────────
-    # ★ 第十一輪新增。前十輪只驗「不干涉」與「裝得進去」，**從來沒有問過
-    #   「裝好之後掉不掉得出來」**。使用者第十輪之後說「我仍然看不出這機殼要
-    #   怎麼組裝在一起」，量出來的答案是：碟架往 −Y 浮 3.00 mm、後牆往 −Y
-    #   走 12 mm 都沒有任何幾何擋住。兩件都是 failures=0 底下的。
-    #   量法：把某一件平移 δ，看撞到誰。play ≈ SLIDE_FIT ⇒ 鎖住；
-    #   走得掉 ⇒ 那是釋放方向，必須是**宣告過**的，而且要有 detent 守著。
+    # ── 保持力真相表：Chassis 是固定障礙物，不是待保持的可動件 ───────
     log("--- 保持力真相表（六向約束）---")
-    HOLD_RELEASE = {  # 允許自由的唯一方向；None = 六向全鎖
-        "Bottom_Tray": None,  # 基準件
-        "Side_Left_MB": None,
-        "Side_Right_MB": None,
-        "Rear_IO_PCIe": None,  # 第十一輪：楔的直角面擋住 −Y（第十輪是自由的）
-        "HDD_Rack": None,  # 第十一輪：RACK_STOP_Y 盲端擋住 −Y（第十輪浮 3.00）
+    HOLD_RELEASE = {
+        "HDD_Rack": None,
         "Top_MB": None,
-        "Front_Shroud": "+Y",  # 唯一徒手可拆的蓋（10 顆半球 detent，刻意可 cam-out）
-        "HDD_Tray": "+Y",  # 熱插拔
+        "Front_Shroud": "+Y",
+        "HDD_Tray": "+Y",
     }
-    _hold_need = set(D.STRUCT_PART_KEYS) - {"MB_Nut", "PCIeBar", "PCIeBlank"}
-    if not _hold_need <= set(HOLD_RELEASE):  # 硬規則 7：漏件就爆，不准手列漏掉
-        raise SystemExit(f"保持力真相表漏了機殼件：{sorted(_hold_need - set(HOLD_RELEASE))}")
-    HOLD_LOCKED, HOLD_FREE = 0.75, 6.0
-    hold_shapes = {k: shapes[k] for k in HOLD_RELEASE if k in shapes}
-    hold_bb = {k: v.BoundBox for k, v in hold_shapes.items()}
+    if set(HOLD_RELEASE) != set(D.STRUCT_PART_KEYS):
+        raise SystemExit(
+            f"保持力真相表與 STRUCT_PART_KEYS 不一致："
+            f"missing={sorted(set(D.STRUCT_PART_KEYS) - set(HOLD_RELEASE))} "
+            f"extra={sorted(set(HOLD_RELEASE) - set(D.STRUCT_PART_KEYS))}"
+        )
+    hold_shapes = {k: shapes[k] for k in HOLD_RELEASE}
+    fixed_hold = {"Chassis_Body": chassis, **hold_shapes}
+
+    def without_elastic_detents(moving, key, shape):
+        out = shape
+        cutters = []
+        if moving == "Top_MB" and key == "Chassis_Body":
+            cutters = B.top_detents(0.05)
+        elif moving == "Front_Shroud" and key == "Chassis_Body":
+            cutters = (B.shroud_detents(True, 0.05) + B.shroud_detents(False, 0.05)
+                       + B.shroud_lap_detents(False, 0.05))
+        elif moving == "Front_Shroud" and key == "Top_MB":
+            cutters = B.shroud_lap_detents(True, 0.05)
+        for cutter in cutters:
+            out = out.cut(cutter)
+        return out
 
     def hold_hit(name, vec, delta):
-        mv = hold_shapes[name].copy()
-        mv.translate(App.Vector(*[c * delta for c in vec]))
-        mb, worst, wv = mv.BoundBox, None, 0.0
-        for other, osh in hold_shapes.items():
-            if other == name:
+        moving = hold_shapes[name].copy()
+        moving.translate(App.Vector(*(v * delta for v in vec)))
+        worst, worst_v = None, 0.0
+        for key, obstacle in fixed_hold.items():
+            if key == name or obstacle is None:
                 continue
-            ob = hold_bb[other]
-            if (mb.XMax < ob.XMin - 0.1 or mb.XMin > ob.XMax + 0.1
-                    or mb.YMax < ob.YMin - 0.1 or mb.YMin > ob.YMax + 0.1
-                    or mb.ZMax < ob.ZMin - 0.1 or mb.ZMin > ob.ZMax + 0.1):
-                continue
-            v = common_vol(mv, osh)
-            if v > wv:
-                worst, wv = other, v
-        return worst, wv
+            obstacle = without_elastic_detents(name, key, obstacle)
+            value = common_vol(moving, obstacle)
+            if value > worst_v:
+                worst, worst_v = key, value
+        return worst, worst_v
 
     for name in sorted(hold_shapes):
-        rel = HOLD_RELEASE[name]
-        for tag, vec in (("+X", (1, 0, 0)), ("-X", (-1, 0, 0)), ("+Y", (0, 1, 0)),
-                         ("-Y", (0, -1, 0)), ("+Z", (0, 0, 1)), ("-Z", (0, 0, -1))):
-            who, vol = hold_hit(name, vec, HOLD_LOCKED)
-            if tag == rel:
-                if vol > INTERFERE_MAX:
-                    fail(f"{name} {tag} 是宣告的釋放方向，卻走不動（撞 {who}）")
-                    continue
-                _, v2 = hold_hit(name, vec, HOLD_FREE)
-                (ok if v2 <= INTERFERE_MAX else fail)(
-                    f"{name} {tag} 釋放方向淨空 >{HOLD_FREE}（可徒手拆）"
+        release = HOLD_RELEASE[name]
+        for tag, vec in (("+X", (1, 0, 0)), ("-X", (-1, 0, 0)),
+                         ("+Y", (0, 1, 0)), ("-Y", (0, -1, 0)),
+                         ("+Z", (0, 0, 1)), ("-Z", (0, 0, -1))):
+            who, value = hold_hit(name, vec, 0.75)
+            if tag == release:
+                _, far_value = hold_hit(name, vec, 6.0)
+                (ok if value <= INTERFERE_MAX and far_value <= INTERFERE_MAX else fail)(
+                    f"{name} {tag} 是宣告的釋放方向，至少 6.0 mm 淨空"
                 )
             else:
-                (ok if vol > INTERFERE_MAX else fail)(
-                    f"{name} {tag} 被 {who} 鎖住（play <= {HOLD_LOCKED}）"
-                    if vol > INTERFERE_MAX else
-                    f"{name} {tag} 走 {HOLD_LOCKED} mm 沒撞到任何東西 —— 這個方向沒有保持力"
+                (ok if value > INTERFERE_MAX else fail)(
+                    f"{name} {tag} 被 {who} 鎖住（play <= 0.75 mm）"
+                    if value > INTERFERE_MAX else
+                    f"{name} {tag} 可自由走 0.75 mm，缺少幾何保持力"
                 )
 
     log("--- interference ---")
-    exempt = set()  # 沒有任何刻意干涉；要加就得同時寫理由
+    exempt = set()
     keys = [k for k in D.STL_NAMES if k in shapes]
-    for a, b in [p for p in itertools.combinations(keys, 2) if frozenset(p) not in exempt]:
-        v = common_vol(shapes[a], shapes[b])
-        (fail if (v < 0 or v > INTERFERE_MAX) else ok)(
-            f"{'interfere' if (v < 0 or v > INTERFERE_MAX) else 'no interfere'} {a}/{b} {v:.2f}"
+    for a, b in itertools.combinations(keys, 2):
+        if frozenset((a, b)) in exempt:
+            continue
+        value = common_vol(shapes[a], shapes[b])
+        (fail if value < 0 or value > INTERFERE_MAX else ok)(
+            f"{'interfere' if value < 0 or value > INTERFERE_MAX else 'no interfere'} {a}/{b} {value:.2f}"
         )
 
-    # ── 虛擬件 + 規格淨空區 ───────────────────────────────────────
+    # ── 虛擬硬體與規格淨空 ───────────────────────────────────────────
     log("--- fit (虛擬件 / 規格淨空) ---")
     mocks = hardware_mocks()
-    for mn in sorted(mocks):
-        worst_p, worst_v = None, 0.0
-        for pn, sh in shapes.items():
-            v = common_vol(mocks[mn], sh)
-            if v < 0:
-                worst_p, worst_v = pn, float("inf")
+    for mock_name in sorted(mocks):
+        worst_name, worst_v = None, 0.0
+        for part_name, shape in shapes.items():
+            value = common_vol(mocks[mock_name], shape)
+            if value < 0:
+                worst_name, worst_v = part_name, float("inf")
                 break
-            if v > worst_v:
-                worst_p, worst_v = pn, v
+            if value > worst_v:
+                worst_name, worst_v = part_name, value
         (fail if worst_v > INTERFERE_MAX else ok)(
-            f"{mn} {'hits ' + str(worst_p) + f' {worst_v:.1f} mm3' if worst_v > INTERFERE_MAX else 'clear'}"
+            f"{mock_name} "
+            + (f"hits {worst_name} {worst_v:.1f} mm3" if worst_v > INTERFERE_MAX else "clear")
         )
 
-    # ★ 第九輪：**四層托盤都要驗**。總成裡只放了第 0 層 → 其餘三層等於沒被驗過，
-    #   而使用者一眼看出來的「最下面那層卡不住」正好就在沒被驗的那一側。
-    #   硬規則 7 的精神：清單要從 range(HDD_LEVELS) 展開，不是手挑一層。
-    for lv in range(D.HDD_LEVELS):
-        t_lv = B.make_hdd_tray_placed(lv)
+    for level in range(D.HDD_LEVELS):
+        placed = B.make_hdd_tray_placed(level)
         bad = []
-        for k in range(D.HDD_LEVELS):
-            for tag in (f"HDD_L{k}", f"HDD_L{k}_接頭"):
-                v = common_vol(mocks[tag], t_lv)
-                if v > INTERFERE_MAX:
-                    bad.append(f"{tag} {v:.1f}")
-        for pn in ("HDD_Rack", "Front_Shroud", "Top_MB", "Side_Left_MB", "Side_Right_MB"):
-            if pn in shapes:
-                v = common_vol(shapes[pn], t_lv)
-                if v > INTERFERE_MAX:
-                    bad.append(f"{pn} {v:.1f}")
+        for other_level in range(D.HDD_LEVELS):
+            for tag in (f"HDD_L{other_level}", f"HDD_L{other_level}_接頭"):
+                value = common_vol(mocks[tag], placed)
+                if value > INTERFERE_MAX:
+                    bad.append(f"{tag} {value:.1f}")
+        for part_name in ("HDD_Rack", "Front_Shroud", "Top_MB", "Chassis_Body"):
+            value = common_vol(shapes[part_name], placed)
+            if value > INTERFERE_MAX:
+                bad.append(f"{part_name} {value:.1f}")
         (fail if bad else ok)(
-            f"碟托盤 lv{lv} {'撞：' + '; '.join(bad) if bad else '與四層碟、接頭區、機殼件皆不干涉'}"
+            f"碟托盤 lv{level} " + ("撞：" + "; ".join(bad) if bad else "與硬體／機殼不干涉")
         )
-        # 層間氣隙：碟頂 → 上一層托盤底之間那條縫，任何印件都不准伸進去
-        if lv + 1 < D.HDD_LEVELS:
-            zg = D.tray_z0(lv) + D.TRAY_T + D.HDD_H + D.TRAY_AIR_GAP / 2
-            slab = mk_box(D.HDD_X0 + 5, D.HDD_Y0 + 5, zg - 0.2, D.HDD_X1 - 5, D.HDD_Y1 - 5, zg + 0.2)
-            worst = max(
-                [(common_vol(slab, sh), pn) for pn, sh in shapes.items()]
-                + [(common_vol(slab, B.make_hdd_tray_placed(k)), f"tray{k}")
-                   for k in range(D.HDD_LEVELS)]
+        if level + 1 < D.HDD_LEVELS:
+            zg = D.tray_z0(level) + D.TRAY_T + D.HDD_H + D.TRAY_AIR_GAP / 2
+            slab = mk_box(D.HDD_X0 + 5, D.HDD_Y0 + 5, zg - 0.2,
+                          D.HDD_X1 - 5, D.HDD_Y1 - 5, zg + 0.2)
+            candidates = [(common_vol(slab, shape), name) for name, shape in shapes.items()]
+            candidates.extend(
+                (common_vol(slab, B.make_hdd_tray_placed(k)), f"tray{k}")
+                for k in range(D.HDD_LEVELS)
             )
+            worst = max(candidates)
             (fail if worst[0] > INTERFERE_MAX else ok)(
-                f"lv{lv} 碟頂上方 {D.TRAY_AIR_GAP} mm 氣隙淨空"
-                f"{'' if worst[0] <= INTERFERE_MAX else f'：{worst[1]} {worst[0]:.1f}'}"
+                f"lv{level} 碟頂上方 {D.TRAY_AIR_GAP:.2f} mm 氣隙淨空"
+                + (f"：{worst[1]} {worst[0]:.1f}" if worst[0] > INTERFERE_MAX else "")
             )
 
-    # ── 裝配動作：最終位置合法 ≠ 走得到那個位置 ─────────────────────
+    # ── 裝配動作：依 ASSEMBLY_STEPS，場上只保留已安裝件 ───────────────
     log("--- 裝配動作 ---")
 
     def sweep(shape, dx=0.0, dy=0.0, dz=0.0, steps=None):
-        """
-        把包絡沿 (dx,dy,dz) 掃出的體積；步長取件最小邊的 0.9 倍，避免中間漏空。
-        `steps` 可以指定步數：**長行程的滑入**（側板 264 mm、頂蓋 298 mm）用預設步長
-        會變成上百次 fuse，而那些接合面沿 Y 是等剖面的，粗一點的步長不會漏掉東西。
-        """
-        b = shape.BoundBox
+        box_ = shape.BoundBox
         span = max(abs(dx), abs(dy), abs(dz))
-        step = max(min(b.XLength, b.YLength, b.ZLength) * 0.9, 1.0)
-        n = steps or max(1, int(math.ceil(span / step)))
-        out = shape
-        for i in range(1, n + 1):
-            mv = shape.copy()
-            mv.translate(App.Vector(dx * i / n, dy * i / n, dz * i / n))
-            out = out.fuse(mv)
-        return out
+        step = max(min(box_.XLength, box_.YLength, box_.ZLength) * 0.9, 1.0)
+        count = steps or max(1, int(math.ceil(span / step)))
+        swept = shape
+        for i in range(1, count + 1):
+            moved = shape.copy()
+            moved.translate(App.Vector(dx * i / count, dy * i / count, dz * i / count))
+            swept = swept.fuse(moved)
+        return swept
 
-    def hits(swept, skip=()):
-        worst_p, worst_v = None, 0.0
-        for pn, sh in shapes.items():
-            if pn in skip:
+    def hit_shapes(swept, obstacles, skip=()):
+        worst_name, worst_v = None, 0.0
+        for name, shape in obstacles.items():
+            if name in skip or shape is None:
                 continue
-            v = common_vol(swept, sh)
-            if v > worst_v:
-                worst_p, worst_v = pn, v
-        return worst_p, worst_v
-
-    # 0) ★ 第十輪：**照使用者指定的順序逐步裝**（底板 → 側板 → 後板 → 碟架 → 頂蓋 → 前罩）。
-    #    第八／九輪每一條掃描都拿**完整總成**當障礙物 —— 那只回答「這一件在最後那個
-    #    場景裡動得了嗎」，從來沒有回答「照這個順序裝得起來嗎」。
-    #    現在第 i 件掃的時候，場上只有第 0..i−1 件。
-    #    detent 是**刻意的彈性過盈**，掃描前要把公件從障礙物上扣掉，否則這條檢查
-    #    永遠紅，而且紅的是設計意圖不是缺陷。
-    def detent_free(pn, sh):
-        ds = []
-        if pn == "Bottom_Tray":
-            ds = (B.floor_detents(True, 0.05) + B.floor_detents(False, 0.05)
-                  + B.floor_rear_detents(0.05) + B.shroud_lap_detents(False, 0.05))
-        elif pn in ("Side_Left_MB", "Side_Right_MB"):
-            lf = pn.endswith("Left_MB")
-            ds = B.rear_tab_detents(lf, 0.05) + B.shroud_detents(lf, 0.05)
-        elif pn == "Top_MB":
-            ds = B.shroud_lap_detents(True, 0.05)
-        for d in ds:
-            sh = sh.cut(d)
-        return sh
+            value = common_vol(swept, shape)
+            if value > worst_v:
+                worst_name, worst_v = name, value
+        return worst_name, worst_v
 
     installed = {}
-    for si, (key, dy) in enumerate(D.ASSEMBLY_STEPS):
-        sh = shapes.get(key)
-        if sh is None:
-            continue
+    for step_index, (key, dy) in enumerate(D.ASSEMBLY_STEPS):
+        shape = shapes[key]
         if abs(dy) < 1e-9:
-            installed[key] = detent_free(key, sh)
-            ok(f"組裝 {si + 1}. {key}：基準件（放著不動）")
+            installed[key] = shape
+            ok(f"組裝 {step_index + 1}. {key}：固定基準件")
             continue
-        start = sh.copy()
+        start = shape.copy()
         start.translate(App.Vector(0, -dy, 0))
         swept = sweep(start, dy=dy, steps=50 if abs(dy) > 60 else None)
-        wp, wv = None, 0.0
-        for pn, osh in installed.items():
-            v = common_vol(swept, osh)
-            if v > wv:
-                wp, wv = pn, v
-        (fail if wv > INTERFERE_MAX else ok)(
-            f"組裝 {si + 1}. {key} 沿 Y {dy:+.1f} mm 裝入"
-            + (f"：撞已裝好的 {wp} {wv:.1f} mm³" if wv > INTERFERE_MAX
-               else f"（場上已有 {len(installed)} 件，路徑淨空）")
+        obstacles = {
+            name: without_elastic_detents(key, name, obstacle)
+            for name, obstacle in installed.items()
+        }
+        who, value = hit_shapes(swept, obstacles)
+        (fail if value > INTERFERE_MAX else ok)(
+            f"組裝 {step_index + 1}. {key} 沿 Y {dy:+.1f} mm "
+            + (f"撞 {who} {value:.1f} mm³" if value > INTERFERE_MAX else "路徑淨空")
         )
-        installed[key] = detent_free(key, sh)
-    log("（電源／主板／PCIe 卡在第 4 與第 5 步之間裝入，見下方各自的掃描）")
+        installed[key] = shape
+    log("（主板／PSU／PCIe 卡在 Chassis 就位後、Rack 滑入前安裝。）")
 
-    # 1) PCIe 卡：拆掉 PCIeBar 後整片抬 PCIE_ENGAGE 必須無阻
+    # PCIe：Bar 在位時擋四槽；卸兩螺絲後 Bar 直接沿 −Y 抽出，卡再抬升。
+    if bar is not None:
+        held = sum(
+            common_vol(sweep(mocks[f"PCIe{i}_耳keepout"], dz=D.PCIE_ENGAGE), bar)
+            > INTERFERE_MAX
+            for i in range(D.PCIE_COUNT)
+        )
+        (ok if held == D.PCIE_COUNT else fail)(f"PCIeBar 擋住 {held}/{D.PCIE_COUNT} 槽抬升")
+        lock_screws = [B.place_pcie_lock_screw(B.make_mb_screw(), hx)
+                       for hx in D.pcie_lock_x()]
+        screw_hold = [common_vol(sweep(bar, dy=-1.0), screw) for screw in lock_screws]
+        (ok if all(value > INTERFERE_MAX for value in screw_hold) else fail)(
+            f"兩顆鎖固螺絲在位時擋住 Bar 外抽 {[round(v, 1) for v in screw_hold]} mm³"
+        )
+        obstacles = {name: shape for name, shape in shapes.items() if name != "PCIeBar"}
+        who, value = hit_shapes(sweep(bar, dy=-(D.PCIE_BAR_T + D.PCIE_RIB_D + 10.0)), obstacles)
+        (fail if value > INTERFERE_MAX else ok)(
+            "卸兩螺絲後 PCIeBar 沿 −Y 抽出 "
+            + (f"撞 {who} {value:.1f} mm³" if value > INTERFERE_MAX else "路徑淨空")
+        )
     for i in range(D.PCIE_COUNT):
         blocked = []
         for tag in (f"PCIe{i}_bracket", f"PCIe{i}_card", f"PCIe{i}_耳keepout"):
-            p, v = hits(sweep(mocks[tag], dz=D.PCIE_ENGAGE), skip=("PCIeBar",))
-            if v > INTERFERE_MAX:
-                blocked.append(f"{tag}→{p} {v:.1f}")
+            obstacles = {name: shape for name, shape in shapes.items() if name != "PCIeBar"}
+            who, value = hit_shapes(sweep(mocks[tag], dz=D.PCIE_ENGAGE), obstacles)
+            if value > INTERFERE_MAX:
+                blocked.append(f"{tag}→{who} {value:.1f}")
         (fail if blocked else ok)(
-            f"PCIe{i} {'抬升受阻：' + '; '.join(blocked) if blocked else '垂直裝拆路徑淨空'}"
+            f"PCIe{i} " + ("抬升受阻：" + "; ".join(blocked) if blocked else "拆 Bar 後垂直抬升淨空")
         )
-    # 2) 壓條鎖上以後，同一個抬升必須被它擋住
-    if bar is not None:
-        held = sum(
-            1 for i in range(D.PCIE_COUNT)
-            if common_vol(sweep(mocks[f"PCIe{i}_耳keepout"], dz=D.PCIE_ENGAGE), bar) > INTERFERE_MAX
-        )
-        (ok if held == D.PCIE_COUNT else fail)(f"PCIeBar 擋住 {held}/{D.PCIE_COUNT} 槽的抬升")
-        p, v = hits(mocks["PCIe0_耳keepout"])
-        (ok if v <= INTERFERE_MAX else fail)(
-            f"壓條在裝好狀態下不壓進折耳帶{'' if v <= INTERFERE_MAX else f'：{p} {v:.1f}'}"
-        )
-        if "Top_MB" in shapes:
-            lid_hold = sum(
-                1 for i in range(D.PCIE_COUNT)
-                if common_vol(sweep(mocks[f"PCIe{i}_耳keepout"], dz=D.PCIE_ENGAGE),
-                              shapes["Top_MB"]) > INTERFERE_MAX
-            )
-            (ok if lid_hold == 0 else fail)(f"Top_MB 不兼差壓卡（{lid_hold} 槽）")
-    # 2b) 壓帽：旋得上去、而且牙是**螺旋**（轉半牙距 → 必撞）
-    if nut is not None and tray is not None:
-        bad = [
-            letter for letter, (hx, hy) in D.HOLES_MM.items()
-            if common_vol(B.place_mb_nut(B.make_mb_nut(), hx, hy, D.BOARD_TOP_Z), tray)
-            > INTERFERE_MAX
-        ]
-        (fail if bad else ok)(
-            f"壓帽{'旋不到工作位（牙撞牙）：' + str(bad) if bad else f'九孔皆可旋到板面（{len(D.HOLES_MM)}/9）'}"
-        )
-        hx, hy = D.HOLES_MM["B"]
-        n2 = nut.copy()
-        n2.rotate(App.Vector(hx, hy, 0), App.Vector(0, 0, 1), 180.0)
-        v = common_vol(n2, tray)
-        (ok if v > INTERFERE_MAX else fail)(
-            f"牙是真螺旋：相位轉 180° 撞 {v:.1f} mm³"
-            if v > INTERFERE_MAX else f"相位轉 180° 只撞 {v:.2f} mm³ — 軸對稱假螺紋"
-        )
-    # 3) 硬碟：第八輪是**平躺**，托盤自 +Y 往前抽出（不是垂直抽）。
-    #    這條是整輪最重要的動作檢查：換碟不必拆頂蓋、不必拆前罩、不必動上面幾層。
-    pull = D.HDD_W + D.TRAY_FRONT_GAP + 10.0
-    for lv in range(D.HDD_LEVELS):
-        p, v = hits(sweep(mocks[f"HDD_L{lv}"], dy=pull), skip=("HDD_Tray",))
-        (fail if v > INTERFERE_MAX else ok)(
-            f"HDD 第 {lv} 層 "
-            f"{'自 +Y 抽出撞 ' + str(p) + f' {v:.1f}' if v > INTERFERE_MAX else f'自 +Y 抽出 {pull:.1f} mm 路徑淨空'}"
-        )
-    # 3b) 碟架自 +Y 滑入（推到 y=180.34），路上不能撞主板／電源／PCIe 卡
+
+    # 主板沒有 PCB 上方凸柱；螺絲最後才鎖，PCB 可直接由上方落到 Ø8 支撐肩。
+    pcb_obstacles = {"Chassis_Body": chassis}
+    who, value = hit_shapes(sweep(mocks["主板PCB"], dz=D.AREA_A_CLEARANCE), pcb_obstacles)
+    (fail if value > INTERFERE_MAX else ok)(
+        "主板由上方垂直落到支撐肩 "
+        + (f"撞 {who} {value:.1f} mm³" if value > INTERFERE_MAX else "路徑淨空")
+    )
+
+    # Rack 在硬體之後滑入；除已裝 Chassis 外，另逐件檢查 PSU／PCB／PCIe 卡包絡。
     if rack is not None:
         slide = D.CASE_FRONT - D.HDD_Y0
-        p, v = hits(sweep(rack, dy=slide), skip=("HDD_Rack", "HDD_Tray", "Front_Shroud", "Top_MB"))
-        (fail if v > INTERFERE_MAX else ok)(
-            f"碟架自 +Y 滑入 {slide:.1f} mm "
-            f"{'撞 ' + str(p) + f' {v:.1f}' if v > INTERFERE_MAX else '路徑淨空'}"
-        )
         for tag in ("主板PCB", "PSU_150x86x140", "PCIe0_card", "PCIe3_card"):
-            v = common_vol(sweep(rack, dy=slide), mocks[tag])
-            (fail if v > INTERFERE_MAX else ok)(f"碟架滑入路徑 vs {tag} = {v:.1f} mm³")
-    # 3c) 頂蓋自 +Y 滑入：路上不能撞電源與碟架
+            value = common_vol(sweep(rack, dy=slide), mocks[tag])
+            (fail if value > INTERFERE_MAX else ok)(
+                f"Rack 滑入路徑 vs {tag} = {value:.1f} mm³"
+            )
+
+    # Top 在 Front 拆下後仍可沿 +Y cam-out；公 detent 先自 Chassis 障礙物扣除。
     if top is not None:
-        slide = D.CASE_FRONT - D.FLOOR_Y0
-        p, v = hits(sweep(top, dy=slide), skip=("Top_MB", "Front_Shroud", "HDD_Tray"))
-        (fail if v > INTERFERE_MAX else ok)(
-            f"頂蓋自 +Y 滑入 {slide:.1f} mm "
-            f"{'撞 ' + str(p) + f' {v:.1f}' if v > INTERFERE_MAX else '路徑淨空'}"
+        obstacles = {
+            "Chassis_Body": without_elastic_detents("Top_MB", "Chassis_Body", chassis),
+            "HDD_Rack": rack,
+        }
+        who, value = hit_shapes(sweep(top, dy=D.CASE_FRONT - D.FLOOR_Y0), obstacles)
+        (fail if value > INTERFERE_MAX else ok)(
+            "拆 Front 後 Top 沿 +Y 抽出 "
+            + (f"撞 {who} {value:.1f} mm³" if value > INTERFERE_MAX else "路徑淨空")
         )
-    # 3d) PCIe 壓條：**抬 PCIE_BAR_DROP → 往 −Y 拔**。兩段都要掃。
-    #     舊做法是沿 X 滑，那條路徑逼出了連續橫縫（＝使用者主訴的懸空成因）。
-    if bar is not None:
-        # detent 是**刻意的彈性過盈**（保持力的來源）：公件在蘑菇柱的翼上，
-        # 掃描前要把它從後牆扣掉——否則這條檢查永遠紅，而且紅的是設計意圖不是缺陷。
-        det_all = None
-        for hx in D.pcie_hook_x():
-            for d in B.hook_detents(hx, grow=0.05):
-                det_all = d if det_all is None else det_all.fuse(d)
-        rear_nodet = rear.cut(det_all)
-        others = {k: v for k, v in shapes.items() if k not in ("PCIeBar", "Rear_IO_PCIe")}
-        others["Rear_IO_PCIe"] = rear_nodet
 
-        def hits2(swept):
-            wp, wv = None, 0.0
-            for pn, sh in others.items():
-                v = common_vol(swept, sh)
-                if v > wv:
-                    wp, wv = pn, v
-            return wp, wv
+    # 四層 HDD／托盤均可自 +Y 熱抽換。
+    pull = D.HDD_W + D.TRAY_FRONT_GAP + 10.0
+    for level in range(D.HDD_LEVELS):
+        obstacles = {name: shape for name, shape in shapes.items() if name != "HDD_Tray"}
+        who, value = hit_shapes(sweep(mocks[f"HDD_L{level}"], dy=pull), obstacles)
+        (fail if value > INTERFERE_MAX else ok)(
+            f"HDD lv{level} 自 +Y 抽出 {pull:.1f} mm "
+            + (f"撞 {who} {value:.1f} mm³" if value > INTERFERE_MAX else "路徑淨空")
+        )
 
-        up = sweep(bar, dz=D.PCIE_BAR_DROP)
-        p, v = hits2(up)
-        (fail if v > INTERFERE_MAX else ok)(
-            f"壓條解鎖抬起 {D.PCIE_BAR_DROP} mm "
-            f"{'撞 ' + str(p) + f' {v:.1f}' if v > INTERFERE_MAX else '路徑淨空'}"
-        )
-        lifted = bar.copy()
-        lifted.translate(App.Vector(0, 0, D.PCIE_BAR_DROP))
-        p, v = hits2(sweep(lifted, dy=-(D.PCIE_HOOK_NECK_D + D.PCIE_HOOK_HEAD_D + 10.0)))
-        (fail if v > INTERFERE_MAX else ok)(
-            f"壓條抬起後往 −Y 拔出 "
-            f"{'撞 ' + str(p) + f' {v:.1f}' if v > INTERFERE_MAX else '路徑淨空（不必拆頂蓋、不必沿 X 滑）'}"
-        )
-        (ok if D.DETENT_DEPTH <= 0.6 and D.DETENT_DEPTH < D.DETENT_R else fail)(
-            f"detent 凸出 {D.DETENT_DEPTH} mm（< 半徑 {D.DETENT_R}，靠翼的彈性爬過去）"
-        )
-        # 落到定位時 detent **不干涉**（過盈只發生在行程中）→ 前面的 interference 段就是證據
-        (ok if common_vol(bar, rear) <= INTERFERE_MAX else fail)(
-            f"壓條落到定位與後牆不干涉 {common_vol(bar, rear):.2f} mm³"
-        )
-    # 3e) 前罩自 +Y 套上：★ 第九輪新增。前罩補了地板之後，那片地板舌會**在滑動途中
-    #     撞到主板柱**（L／M 兩孔 y=227.33，柱是自 z=0 長起的 Ø8 圓柱）——
-    #     最終位置合法、路被擋住，靜態檢查全綠。底板留實心柱腳、前罩挖讓位槽。
+    # Front 自 +Y 套上；忽略刻意的彈性 detent，但保留所有剛性搭接與主板柱腳。
     if shroud is not None:
-        det_side, det_lap = None, {}
-        for is_left in (True, False):
-            for s in B.shroud_detents(is_left, grow=0.05):
-                det_side = s if det_side is None else det_side.fuse(s)
-        for pn, is_top in (("Top_MB", True), ("Bottom_Tray", False)):
-            for s in B.shroud_lap_detents(is_top, grow=0.05):
-                det_lap[pn] = s if pn not in det_lap else det_lap[pn].fuse(s)
-        others = {}
-        for pn, sh in shapes.items():
-            if pn in ("Front_Shroud", "HDD_Tray"):
-                continue
-            if pn in ("Side_Left_MB", "Side_Right_MB"):
-                sh = sh.cut(det_side)
-            if pn in det_lap:
-                sh = sh.cut(det_lap[pn])
-            others[pn] = sh
-
-        def hits3(swept):
-            wp, wv = None, 0.0
-            for pn, sh in others.items():
-                v = common_vol(swept, sh)
-                if v > wv:
-                    wp, wv = pn, v
-            return wp, wv
-
-        p, v = hits3(sweep(shroud, dy=D.SHROUD_LAP + D.SHROUD_D + 20.0))
-        (fail if v > INTERFERE_MAX else ok)(
-            f"前罩自 +Y 套上 "
-            f"{'撞 ' + str(p) + f' {v:.1f}' if v > INTERFERE_MAX else '路徑淨空（含主板柱讓位槽）'}"
+        obstacles = {
+            "Chassis_Body": without_elastic_detents("Front_Shroud", "Chassis_Body", chassis),
+            "Top_MB": without_elastic_detents("Front_Shroud", "Top_MB", top),
+            "HDD_Rack": rack,
+        }
+        who, value = hit_shapes(
+            sweep(shroud, dy=D.SHROUD_LAP + D.SHROUD_D + 20.0), obstacles
         )
-        # 反向：讓位槽不能大到讓搭接失效——柱腳與槽必須真的成對
-        bands = B.shroud_floor_stud_bands()
-        (ok if len(bands) == 2 else fail)(
-            f"搭接帶裡有 {len(bands)} 根主板柱要讓位（L／M 兩孔 y={D.HOLES_MM['L'][1]:.2f}）"
+        (fail if value > INTERFERE_MAX else ok)(
+            "Front 自 +Y 套上 "
+            + (f"撞 {who} {value:.1f} mm³" if value > INTERFERE_MAX else "路徑淨空")
         )
-        for bx0, bx1 in bands:
-            xm = (bx0 + bx1) / 2
-            ym = D.BAY_SPLIT_Y - D.SHROUD_LAP / 2
-            (ok if pt_inside(tray, xm, ym, D.FLOOR_T - 0.3, 0.02) else fail)(
-                f"底板 x={xm:.2f} 保留整厚柱腳"
-            )
-            (fail if pt_inside(shroud, xm, ym, D.FLOOR_T - 0.3, 0.02) else ok)(
-                f"前罩 x={xm:.2f} 有對應讓位槽"
-            )
 
-    # 4) 主板：抬過細軸頂再往後推進 I/O shield（壓帽是之後才鎖的）
-    lift = D.MB_STUD_TOP_Z - (D.BOARD_TOP_Z - D.PCB_T) + 2.0
-    p, v = hits(sweep(mocks["主板PCB"], dz=lift), skip=("MB_Nut", "Top_MB"))
-    (fail if v > INTERFERE_MAX else ok)(
-        f"主板垂直裝入路徑（抬 {lift:.1f} 過細軸頂）"
-        f"{'撞 ' + str(p) + f' {v:.1f}' if v > INTERFERE_MAX else '淨空'}"
-    )
-    # 5) 電源：先橫移讓開頂蓋承托肩，再垂直落入（沒有蓋子時）
+    # PSU 在 Rack／Top 前由上方落入；只把一體 Chassis 當障礙物。
     psu = mocks["PSU_150x86x140"]
-    p, v = hits(sweep(psu, dx=D.PSU_SLIDE_X, dy=D.PSU_SLIDE_Y))
-    (ok if D.PSU_SLIDE_Y > D.TOP_HOOK_D else fail)(
-        f"電源前移量 {D.PSU_SLIDE_Y} > 後牆頂鉤唇伸出 {D.TOP_HOOK_D}"
+    shifted = psu.copy()
+    shifted.translate(App.Vector(D.PSU_SLIDE_X, D.PSU_SLIDE_Y, 0))
+    who, value = hit_shapes(
+        sweep(shifted, dz=D.OUTER_TOP_Z - D.ATX_Z0),
+        {"Chassis_Body": chassis},
     )
-    if v > INTERFERE_MAX:
-        fail(f"電源前移 {D.PSU_SLIDE_Y} mm 就撞 {p} {v:.1f}")
-    else:
-        ok(f"電源可前移 {D.PSU_SLIDE_Y} mm（讓開後牆頂鉤唇）")
-        shifted = psu.copy()
-        shifted.translate(App.Vector(D.PSU_SLIDE_X, D.PSU_SLIDE_Y, 0))
-        p, v = hits(sweep(shifted, dz=D.OUTER_TOP_Z - D.ATX_Z0), skip=("Top_MB", "Front_Shroud"))
-        (fail if v > INTERFERE_MAX else ok)(
-            f"電源自上方落入路徑{'撞 ' + str(p) + f' {v:.1f}' if v > INTERFERE_MAX else '淨空（掀蓋後）'}"
-        )
+    (fail if value > INTERFERE_MAX else ok)(
+        "PSU 自上方落入 "
+        + (f"撞 {who} {value:.1f} mm³" if value > INTERFERE_MAX else "路徑淨空")
+    )
 
     # ── A1 / STL ─────────────────────────────────────────────────
     log("--- A1 / STL ---")
@@ -1725,6 +1834,17 @@ def main():
         else:
             ok(f"STL {fn} {os.path.getsize(path)}")
             stl_lines.append(f"{fn}\t{os.path.getsize(path)}")
+    actual_stl = {
+        fn for fn in os.listdir(STL_DIR)
+        if fn.lower().endswith(".stl")
+    }
+    expected_stl = set(D.STL_NAMES.values())
+    (ok if actual_stl == expected_stl else fail)(
+        "STL 目錄與 manifest 完全一致"
+        if actual_stl == expected_stl else
+        f"STL/manifest 不一致 missing={sorted(expected_stl - actual_stl)} "
+        f"extra={sorted(actual_stl - expected_stl)}"
+    )
     for fn in D.REMOVED_STL:
         path = os.path.join(STL_DIR, fn)
         (fail if os.path.isfile(path) else ok)(
@@ -1732,9 +1852,8 @@ def main():
         )
 
     w, d, h = D.envelope_mm()
-    # ★ 這兩個數字不一樣，兩個都要印：只印前者的話下一輪還是拿它去買料。
-    #   總成裡每個 STL 只放一份（碟托盤第 0 層那片、壓帽 B 孔那顆），
-    #   逐件加總少算 碟托盤 ×3 + 壓帽 ×8 + 槽蓋 ×3 = 219 cm³（20%）。硬規則 26。
+    # 一件一份與含份數都要報；後者才是購料基準。
+    # 第十二輪額外份數為 Tray ×4、Blank ×4、MB_Screw ×9。
     total = sum(s.Volume for k, s in shapes.items()) / 1000.0
     total_qty = sum(s.Volume * D.PART_QTY[k] for k, s in shapes.items()) / 1000.0
     log(
@@ -1750,15 +1869,17 @@ def main():
         fail(f"envelope out of expected band {w:.1f}x{d:.1f}x{h:.1f}")
     vol = D.case_volume_l()
     (ok if vol < 15.0 else fail)(f"整機體積 {vol:.2f} L < 使用者要求的 15 L")
-    # ★ 第十輪：舊版是 `install_depth_mm() <= CASE_D + PCIE_BAR_T`——**它在跟自己的
-    #   定義比**，永遠綠（vacuous check，硬規則 16）。而且最凸的其實是蘑菇柱 8.00
-    #   不是壓條 5.00，少報了 3 mm。現在改成對**幾何量出來的實際外凸量**比。
-    if bar is not None and rear is not None:
-        y_min = min(obb(bar).YMin, obb(rear).YMin)
+    # 安裝深度必須把 Chassis、Bar 與兩顆標準 #6-32 pan-head 的真幾何串起來量。
+    if bar is not None and chassis is not None:
+        y_min = min(
+            [obb(bar).YMin, obb(chassis).YMin]
+            + [obb(B.place_pcie_lock_screw(B.make_mb_screw(), hx)).YMin
+               for hx in D.pcie_lock_x()]
+        )
         real = D.CASE_REAR - y_min
         (ok if approx(real, D.rear_outer_protrusion(), 0.05) else fail)(
-            f"後牆外實際外凸 {real:.2f} mm = rear_outer_protrusion() "
-            f"{D.rear_outer_protrusion():.2f}（量出來的，不是用定義推的）"
+            f"完整裝機後實際外凸 {real:.2f} mm = rear_outer_protrusion() "
+            f"{D.rear_outer_protrusion():.2f}（含螺絲頭，從幾何量）"
         )
         (ok if approx(D.install_depth_mm(), D.CASE_D + real, 0.05) else fail)(
             f"安裝深度 {D.install_depth_mm():.2f} = 機殼深 {D.CASE_D:.2f} + 外凸 {real:.2f}"

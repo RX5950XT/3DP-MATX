@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import io
 import math
 import os
+import re
 import sys
 import unittest
 
@@ -200,12 +202,13 @@ class Test參數(unittest.TestCase):
         self.assertGreaterEqual(D.SHROUD_DETENT_R, 0.5)
         self.assertGreaterEqual(len(D.SHROUD_DETENT_Z), 2)
 
-    def test_底板側舌是被夾住的槽不是搭邊(self):
-        """使用者提問 4：底板跟左右板之間真的有滑蓋設計嗎。"""
-        # 舌只有上半片 → 槽下方留得出承載唇
-        self.assertLess(D.FLOOR_LIP_T, D.FLOOR_T)
-        self.assertGreaterEqual(D.FLOOR_T - D.FLOOR_LIP_T, 0.8)
-        self.assertLessEqual(D.FLOOR_LIP, D.WALL - 0.8)
+    def test_Chassis四件一體式有真實重疊(self):
+        self.assertGreaterEqual(D.CHASSIS_OVERLAP, 0.8)
+        self.assertLess(D.CHASSIS_OVERLAP, D.WALL)
+        self.assertEqual(D.ASSEMBLY_STEPS[0], ("Chassis_Body", 0.0))
+        for old in ("Bottom_Tray", "Rear_IO_PCIe", "Side_Left_MB", "Side_Right_MB"):
+            self.assertNotIn(old, D.STL_NAMES)
+            self.assertIn(old, D.REMOVED_SHELL_PARTS)
 
     def test_單一長方體(self):
         w, d, h = D.envelope_mm()
@@ -241,17 +244,20 @@ class Test參數(unittest.TestCase):
             self.skipTest(str(e))
         self.assertEqual({p[0] for p in 渲染預覽.PARTS}, set(D.STL_NAMES.values()))
 
-    def test_STL_NAMES十一件(self):
-        # 11 個 STL＝5 結構（底板／後牆／左右側板／頂蓋）+ 前罩 + 碟架 + 碟托盤
-        #             + PCIe 槽蓋 + PCIe 壓條 + 主板壓帽
-        self.assertEqual(len(D.STL_NAMES), 11)
-        self.assertEqual(len(D.STRUCT_PART_KEYS), 11)
-        self.assertIn("Bottom_Tray", D.STL_NAMES)
-        self.assertEqual(D.TRAY_COUNT, D.HDD_COUNT)  # 碟托盤同一個 STL 印四份
-        for gone in ("ClampTray", "Bottom_ATX", "ClampCap", "HDD_Cage", "Top_HDD"):
-            self.assertNotIn(gone, D.STL_NAMES)
-        for k in D.STRUCT_PART_KEYS:
-            self.assertIn(k, D.STL_NAMES)
+    def test_STL_NAMES八件(self):
+        expected = {
+            "Chassis_Body", "Top_MB", "Front_Shroud", "HDD_Rack",
+            "HDD_Tray", "PCIeBlank", "PCIeBar", "MB_Screw",
+        }
+        self.assertEqual(set(D.STL_NAMES), expected)
+        self.assertEqual(len(D.STL_NAMES), 8)
+        self.assertEqual(
+            D.STRUCT_PART_KEYS,
+            ("Top_MB", "Front_Shroud", "HDD_Rack", "HDD_Tray"),
+        )
+        self.assertEqual(len(set(D.STL_NAMES.values())), len(D.STL_NAMES))
+        for old in ("Bottom_Tray", "Rear_IO_PCIe", "Side_Left_MB", "Side_Right_MB", "MB_Nut"):
+            self.assertNotIn(old, D.STL_NAMES)
 
     def test_產物(self):
         for fn in D.STL_NAMES.values():
@@ -312,72 +318,75 @@ class Test修復回歸(unittest.TestCase):
         self.assertLessEqual(D.SHOULDER_OD, D.MB_KEEPOUT_D)
         self.assertAlmostEqual(D.BOARD_TOP_Z, D.SHOULDER_TOP_Z + D.PCB_T, places=6)
 
-    def test_板躺下後內部連定位唇都放不下(self):
-        """
-        內寬只比板寬多 4.04 mm、內深多 1.00 mm，板底 6.35 又封死 z∈[2.4, 8.75]。
-        第七輪的結論是「螺母座只能放地板以下」；第八輪把螺絲整組拿掉之後，
-        同一條約束換了個形式繼續成立：**連一道從底板往上長的定位唇都放不下**，
-        所以底板與牆的關係是反過來的（底板自 +Y 滑進牆的低位槽）。
-        """
+    def test_板躺下後只有九孔支撐肩可進淨空(self):
         inner_w = (D.FLOOR_X1 - D.FLOOR_X0) - D.BOARD_W
         inner_d = (D.FLOOR_Y1 - D.FLOOR_Y0) - D.BOARD_D
         self.assertLess(inner_w, 5.0)
-        self.assertLess(inner_d, 2.0)
-        # 右側與後側的餘裕都比牆厚小 → 往上長的唇一定戳到板
-        self.assertLess((D.FLOOR_X1 - D.BOARD_RIGHT), D.WALL)
-        self.assertLess((D.BOARD_REAR - D.FLOOR_Y0), D.WALL)
-        # 因此底板改成三面伸舌，插進牆內面 z∈[0, FLOOR_T] 的低位槽
-        self.assertGreater(D.FLOOR_LIP, 0.8)          # 印得出來
-        self.assertLess(D.FLOOR_LIP, D.WALL)          # 不挖穿牆
-        self.assertLessEqual(D.FLOOR_T, D.SHOULDER_TOP_Z - D.SHOULDER_H + 1e-9)
+        # ★ 第十三輪：後牆內面 = I/O aperture 平面（Fig.4 側視 12.27），
+        #   板後緣到它是 2.11 而不是舊的 MARGIN 0.5 —— 連接器面比板緣還往後
+        #   突出 1.14（Fig.5 note 11.30），0.5 的話板根本推不到底。
+        self.assertLess(inner_d, 3.0)
+        self.assertAlmostEqual(
+            D.BOARD_REAR - (D.CASE_REAR + D.WALL), 2.11, places=2
+        )
+        self.assertLess(D.FLOOR_X1 - D.BOARD_RIGHT, D.WALL)
+        self.assertLess(D.BOARD_REAR - D.FLOOR_Y0, D.WALL)
+        self.assertFalse(hasattr(D, "FLOOR_LIP"))
+        self.assertLessEqual(D.SHOULDER_OD, D.MB_KEEPOUT_D)
+        self.assertAlmostEqual(D.SHOULDER_TOP_Z - D.FLOOR_T, 6.35, places=6)
 
     def test_IO開孔外緣留得下keepout(self):
         self.assertGreaterEqual(D.io_edge_material(), D.IO_KEEPOUT + 0.8)
         self.assertLessEqual(D.CASE_LEFT, D.IO_X0 - D.IO_KEEPOUT)
         self.assertLess(D.IO_X0, D.BOARD_LEFT)
 
-    def test_全滑槽組裝一顆螺絲都沒有(self):
-        """使用者要求：後端 I/O 與 PCIe、左右側板、頂蓋、底板、主板托盤全用滑蓋卡槽。"""
-        # 四道滑槽的深度都要「印得出來、又不挖穿 2.4 的牆」
-        for tag, depth in (("底板舌", D.FLOOR_LIP), ("碟架舌", D.RACK_RAIL_T),
-                           ("頂蓋舌", D.TOP_LIP), ("後牆定位舌", D.REAR_TAB_T)):
-            self.assertGreaterEqual(depth, 0.8, msg=tag)   # ≥ 最小可印壁厚
-            self.assertLess(depth, D.WALL, msg=tag)        # 背後還要留牆料
-        self.assertGreater(D.SLIDE_FIT, 0.15)
-        self.assertLess(D.SLIDE_FIT, 0.5)
-        # detent：受的是面內剪力不是層間拉力，但半徑受定位舌厚度限制
-        self.assertGreaterEqual(D.DETENT_R, 0.5)           # 最小可印特徵
-        self.assertLessEqual(2 * D.DETENT_R, D.REAR_TAB_T + D.DETENT_DEPTH + 1e-9)
-        self.assertLess(D.DETENT_DEPTH, D.DETENT_R)
-        # 互鎖鏈的收尾：頂蓋後端半搭接進後牆鉤唇
-        self.assertAlmostEqual(D.TOP_HOOK_T * 2, D.TOP_T, places=6)
-        self.assertGreater(D.TOP_HOOK_D, 3.0)
-        # 前罩搭接後外表面仍齊平（單一長方體）
-        self.assertLess(D.SHROUD_LAP_T, D.WALL)
-        self.assertGreater(D.SHROUD_LAP, 8.0)
+    def test_一體本體與可拆件接合(self):
+        for gone in (
+            "M3_INSERT_D", "M3_TAP", "FLOOR_LIP", "REAR_TAB_D",
+            "REAR_WEDGE_H", "PCIE_HOOK_NECK_W", "PCIE_BAR_DROP",
+        ):
+            self.assertFalse(hasattr(D, gone), msg=gone)
+        self.assertAlmostEqual(
+            D.TOP_LIP,
+            D.WALL - D.GROOVE_BACK_MIN - D.SLIDE_FIT,
+            places=6,
+        )
+        self.assertGreaterEqual(D.TOP_LIP, 1.0)
+        self.assertGreater(D.RACK_RAIL_T, D.SLIDE_FIT)
+        self.assertEqual(len(D.TOP_DETENT_X), 2)
+        self.assertEqual(D.SHROUD_LAP, 14.0)
 
-    def test_碟架側舌高度由PCIe卡導出(self):
-        """
-        右側那條側舌落在 230 長 PCIe 卡的帶裡（卡伸到 y≈219），
-        而且卡插拔時要整片抬 PCIE_ENGAGE —— 所以槽底必須高過「卡頂 + 抬升」。
-        高度是導出的，不是挑一個看起來夠高的數字。
-        """
-        self.assertGreaterEqual(D.RACK_RAIL_Z0, D.PCIE_CARD_TOP_Z + D.PCIE_ENGAGE)
-        self.assertAlmostEqual(D.RACK_RAIL_Z1, D.RACK_RAIL_Z0 + D.RACK_RAIL_H, places=6)
-        # 側舌也不能撞到頂蓋的舌槽（兩者走側板上同一道 x 帶）
-        self.assertLess(D.RACK_RAIL_Z1, D.INNER_TOP_Z - D.TOP_T)
-        # 兩條橫樑都要落在側板槽的 y 帶內，而且中間留得下 SATA 線
-        for by in D.RACK_BEAM_Y:
+    def test_碟架側舌高度由碟架頂導出(self):
+        """側舌貼近碟架頂板以縮短承載力臂，不再由已縮短的 PCIe 卡包絡決定。"""
+        self.assertAlmostEqual(D.RACK_RAIL_Z1, D.HDD_TOP_Z - 2.0, places=6)
+        self.assertAlmostEqual(
+            D.RACK_RAIL_Z0,
+            D.RACK_RAIL_Z1 - D.RACK_RAIL_H,
+            places=6,
+        )
+        self.assertLess(D.RACK_RAIL_Z1, D.RACK_TOP_Z1)
+        self.assertGreater(D.RACK_RAIL_Z0, D.RACK_Z0)
+        # 兩條橫樑都要落在側板槽的 y 帶內，而且中間留得下 SATA 線。
+        for by in D.RACK_RAIL_BEAM_Y:
             self.assertGreater(by - D.RACK_BEAM_W / 2, D.TRAY_Y0 - 1.0)
             self.assertLess(by + D.RACK_BEAM_W / 2, D.BAY_SPLIT_Y)
+        # ★ 第十三輪第三根樑在**前罩段**（坐前罩承托肩），沒有側舌也不該有
+        self.assertEqual(len(D.RACK_BEAM_Y), 3)
+        self.assertEqual(len(D.RACK_RAIL_BEAM_Y), 2)
+        self.assertGreater(max(D.RACK_BEAM_Y), D.BAY_SPLIT_Y)
+        self.assertLess(max(D.RACK_BEAM_Y) + D.RACK_BEAM_W / 2, D.SHROUD_LEDGE_Y1)
         self.assertGreater(abs(D.RACK_BEAM_Y[1] - D.RACK_BEAM_Y[0]), 2 * D.RACK_BEAM_W)
 
-    def test_全件在A1床內(self):
+    def test_一體Chassis名目尺寸在A1床內(self):
+        chassis_dims = (
+            D.CASE_W,
+            D.BAY_SPLIT_Y - (D.CASE_REAR - D.PCIE_RIB_D),
+            D.OUTER_TOP_Z,
+        )
+        self.assertEqual(tuple(round(v, 2) for v in chassis_dims), (252.68, 252.85, 180.12))
+        self.assertTrue(all(v <= D.A1_MAX for v in chassis_dims))
         self.assertLessEqual(D.CASE_W, D.A1_MAX)
-        self.assertLessEqual(D.FLOOR_X1 - D.FLOOR_X0, D.A1_MAX)  # 底板
-        self.assertLessEqual(D.FLOOR_Y1 - D.FLOOR_Y0, D.A1_MAX)
-        self.assertLessEqual(D.OUTER_TOP_Z + D.SKIRT_H, D.A1_MAX)  # 側板／後牆立起來
-        self.assertLessEqual(D.CASE_D, D.A1_MAX * 2)
+        self.assertLessEqual(D.OUTER_TOP_Z, D.A1_H_MAX)
 
     def test_PCIe開孔容得下擋板本體(self):
         self.assertGreater(D.PCIE_OPEN_W, D.PCIE_BRACKET_W)
@@ -388,73 +397,76 @@ class Test修復回歸(unittest.TestCase):
         for gone in (
             "CAP_OD", "CAP_H", "CAP_COUNT", "CAP_SEAT_OD", "CAP_SEAT_RELIEF",
             "STUD_MAJOR", "STUD_MINOR", "STUD_PITCH", "STUD_LEN",
-            "MB_SCREW_TAP", "MB_SCREW_DEPTH", "MB_SCREW_HEAD_D",
+            "MB_SCREW_TAP", "MB_SCREW_DEPTH",
         ):
             self.assertFalse(hasattr(D, gone), msg=f"參數.{gone} 應已刪除")
         self.assertIn("ClampCap", D.REMOVED_SHELL_PARTS)
         self.assertIn("旋蓋.stl", D.REMOVED_STL)
 
-    def test_主板固定是印製階梯螺柱與螺帽(self):
-        """硬規則 6 的三關：牙深 ≥0.5、不破 keepout、牙必須是螺旋（幾何在 verify 驗）。"""
-        self.assertGreaterEqual((D.MB_STUD_MAJOR - D.MB_STUD_MINOR) / 2, 0.5)
-        self.assertLess(D.MB_NUT_OD, D.MB_KEEPOUT_D)
-        self.assertLess(D.MB_STUD_MAJOR, D.PCB_HOLE_D)
-        side = (D.PCB_HOLE_D - D.MB_STUD_MAJOR) / 2
+    def test_主板固定是盲內牙與印製六角螺絲(self):
+        for gone in ("MB_STUD_MAJOR", "MB_STUD_MINOR", "MB_NUT_OD", "MB_NUT_H"):
+            self.assertFalse(hasattr(D, gone), msg=gone)
+        self.assertGreaterEqual(D.MB_THREAD_DEPTH, 0.5)
+        self.assertLess(D.MB_THREAD_MAJOR, D.PCB_HOLE_D)
+        side = (D.PCB_HOLE_D - D.MB_THREAD_MAJOR) / 2
         self.assertGreaterEqual(side, 0.20)
         self.assertLessEqual(side, 0.30)
-        self.assertAlmostEqual(D.MB_THREAD_ENGAGE, D.MB_STUD_DEPTH - D.MB_NUT_GAP, places=6)
-        self.assertGreaterEqual(D.MB_THREAD_ENGAGE, 0.35)
-        crest = D.MB_STUD_PITCH * (1.0 - D.MB_STUD_ROOT_W) - 2 * D.MB_NUT_GAP
-        self.assertGreaterEqual(crest, 0.4)
-        self.assertGreaterEqual(D.MB_NUT_H / D.MB_STUD_PITCH, 2.0)
-        self.assertAlmostEqual(D.MB_STUD_LEN, D.PCB_T + D.MB_NUT_H + 1.0, places=6)
-        self.assertAlmostEqual(D.MB_STUD_TOP_Z, D.SHOULDER_TOP_Z + D.MB_STUD_LEN, places=6)
-        self.assertAlmostEqual(D.MB_NUT_Z0, D.BOARD_TOP_Z, places=6)
-        self.assertEqual(D.MB_NUT_COUNT, len(D.HOLES_MM))
-
-    def test_PCIe壓條長在機殼外面(self):
-        """使用者：「PCIe 壓條通常長在機殼外面，而不是往內突出」。"""
-        room = D.PCIE_BRACKET_ABOVE_CARD - D.PCIE_ENGAGE
-        self.assertLess(room, 1.0)  # 0.06：耳下方放不下固定塊 → 必須可拆
-        self.assertAlmostEqual(D.PCIE_BAR_Z0, D.PCIE_Z1 + D.PCIE_HOLD_GAP, places=6)
-        self.assertGreaterEqual(D.PCIE_BAR_Z0, D.PCIE_CARD_TOP_Z + D.PCIE_ENGAGE)
-        # 壓舌：蓋滿擋板厚度，但**不得伸出後牆內面**
-        self.assertGreaterEqual(D.CASE_REAR + D.PCIE_BAR_TAB_D, D.PCIE_BRACKET_Y1)
-        self.assertLessEqual(D.CASE_REAR + D.PCIE_BAR_TAB_D, D.CASE_REAR + D.WALL)
-        self.assertLessEqual(D.PCIE_BAR_TAB_W, D.PCIE_OPEN_W)
-        # ★ 第九輪：T 軌 + 沿 X 滑入整組刪除（它逼出的連續橫縫讓三根肋變成懸臂）
-        for g in ("PCIE_RAIL_Z0", "PCIE_RAIL_NECK_H", "PCIE_RAIL_HEAD_H",
-                  "PCIE_RAIL_NECK_D", "PCIE_RAIL_HEAD_D"):
-            self.assertFalse(hasattr(D, g), g)
-        # keyhole：落差 >= 頭高，否則寬口與窄段在同一個 Z 上矛盾
-        self.assertGreaterEqual(D.PCIE_BAR_DROP, D.PCIE_HOOK_H)
-        # 解鎖抬起時四個壓舌不能頂到開孔頂
-        self.assertLessEqual(D.PCIE_BAR_Z1 + D.PCIE_BAR_DROP, D.PCIE_Z1 + D.PCIE_LIFT)
-        # 抬升帶由「卡的指入深度」與「壓條解鎖行程」取大者導出
         self.assertAlmostEqual(
-            D.PCIE_LIFT,
-            max(D.PCIE_ENGAGE + 1.5,
-                D.PCIE_HOLD_GAP + D.PCIE_BAR_TAB_H + D.PCIE_BAR_DROP + 0.6),
+            D.MB_THREAD_ENGAGE,
+            D.MB_THREAD_DEPTH - D.MB_THREAD_GAP,
             places=6,
         )
-        # 頭的內面到牆的淨距 = 壓條厚 + 滑配
+        female_crest = D.MB_THREAD_PITCH * (1.0 - D.MB_THREAD_ROOT_W) - 2 * D.MB_THREAD_GAP
+        self.assertGreaterEqual(female_crest, 0.8)
+        self.assertAlmostEqual(D.MB_THREAD_ENGAGEMENT / D.MB_THREAD_PITCH, 2.0, places=6)
         self.assertAlmostEqual(
-            D.PCIE_HOOK_NECK_D - D.PCIE_HOOK_FUSE - D.PCIE_BAR_T, D.PCIE_BAR_FIT, places=6
+            D.MB_SOCKET_DEPTH,
+            D.MB_THREAD_ENGAGEMENT + D.MB_SOCKET_END_GAP,
+            places=6,
         )
-        # 兩顆柱都在開孔頂之上的全寬實料帶，且落在壓條的 X 範圍內
-        self.assertGreaterEqual(D.PCIE_HOOK_Z0, D.PCIE_Z1 + D.PCIE_LIFT)
+        self.assertGreaterEqual(D.MB_SOCKET_BOTTOM_MATERIAL, 0.8)
+        self.assertAlmostEqual(
+            D.MB_SCREW_THREAD_LEN,
+            D.PCB_T + D.MB_THREAD_ENGAGEMENT,
+            places=6,
+        )
+        self.assertLess(D.MB_SCREW_HEAD_D, D.MB_KEEPOUT_D)
+        self.assertEqual(D.MB_SCREW_COUNT, len(D.HOLES_MM))
+
+    def test_PCIe壓條鎖進印製盲內牙且沿用MB_Screw(self):
+        """第十三輪（使用者：那個 PCIe 壓條根本沒有用）。"""
+        self.assertEqual(D.PCIE_BAR_T, 5.0)
+        self.assertEqual(len(D.pcie_lock_x()), 2)
+        self.assertEqual(D.PCIE_BAR_SCREW_COUNT, 2)
+        # 夾持厚 = PCB_T ⇒ 同一顆 MB_Screw 通用，不新增第九種 STL
+        self.assertAlmostEqual(D.PCIE_BAR_SEAT_T, D.PCB_T, places=6)
+        self.assertGreaterEqual(D.PCIE_BAR_CBORE_D, D.MB_SCREW_HEAD_D)
+        self.assertGreaterEqual(D.PCIE_BAR_T - D.PCIE_BAR_SEAT_T, D.MB_SCREW_HEAD_H)
+        # 盲牙不得打穿到內腔
+        self.assertGreaterEqual(
+            (D.CASE_REAR + D.WALL) - D.pcie_lock_socket_end(), 0.8
+        )
+        # 鎖點落在最外兩根槽間肋的正上方（拉力回到肋的上端固定端）
+        ribs = D.pcie_rib_x()
+        self.assertEqual(set(D.pcie_lock_x()), {ribs[0], ribs[-1]})
+        self.assertAlmostEqual(D.PCIE_LIFT, D.PCIE_ENGAGE + 1.5, places=6)
         bx0, bx1 = D.pcie_bar_x()
-        for hx in D.pcie_hook_x():
-            self.assertGreater(hx - D.PCIE_HOOK_HEAD_W / 2, bx0)
-            self.assertLess(hx + D.PCIE_HOOK_HEAD_W / 2, bx1)
-            self.assertLessEqual(hx + D.PCIE_HOOK_HEAD_W / 2, D.CASE_RIGHT)
-        self.assertEqual(len(D.pcie_hook_x()), 2)
+        for x in D.pcie_lock_x():
+            self.assertGreater(x - D.PCIE_BAR_CBORE_D / 2, bx0)
+            self.assertLess(x + D.PCIE_BAR_CBORE_D / 2, bx1)
+        for gone in (
+            "PCIE_BAR_DROP", "PCIE_HOOK_NECK_W", "PCIE_HOOK_HEAD_W",
+            "PCIE_LOCK_PILOT_D", "PCIE_LOCK_PILOT_DEPTH", "PCIE_LOCK_CLEAR_D",
+            "PCIE_LOCK_SCREW_LEN", "PCIE_LOCK_SCREW_HEAD_H", "PCIE_LOCK_BOSS_W",
+        ):
+            self.assertFalse(hasattr(D, gone), msg=gone)
+        self.assertFalse(hasattr(D, "pcie_hook_x"))
 
     def test_PCIe肋不得是懸臂(self):
         """使用者主訴 3：PCIe 那邊幾乎完全懸空，強度太弱、印不出來。"""
         # 繫樑要有厚度（肋的上固定端）
         self.assertGreaterEqual(D.PCIE_TIE_H, 3.0)
-        self.assertLessEqual(D.PCIE_Z1 + D.PCIE_LIFT + D.PCIE_TIE_H, D.INNER_TOP_Z)
+        self.assertLessEqual(D.PCIE_TIE_Z1, D.INNER_TOP_Z)
         # 往機殼外加厚：抗彎慣性矩至少提高一個數量級
         rib_w = D.PCIE_PITCH - D.PCIE_OPEN_W
         i_old = rib_w * D.WALL ** 3 / 12.0
@@ -464,119 +476,75 @@ class Test修復回歸(unittest.TestCase):
         self.assertGreaterEqual(D.PCIE_BAR_Z0, D.PCIE_Z1)
         self.assertGreaterEqual(rib_w, 0.8)  # FDM 最小可印壁厚
 
-    def test_應支援卡長由碟架導出(self):
-        """刻意取捨：碟架置中之後卡與碟架的 X 帶重疊，只能二選一。"""
+    def test_應支援卡長與完整安裝深度皆由幾何鏈導出(self):
         self.assertAlmostEqual(
-            D.PCIE_CARD_LEN, D.TRAY_Y0 - (D.CASE_REAR + D.WALL) - 2.0, places=6
+            D.PCIE_CARD_LEN,
+            D.TRAY_Y0 - (D.CASE_REAR + D.WALL) - 2.0,
+            places=6,
         )
         self.assertGreaterEqual(D.PCIE_CARD_LEN, D.PCIE_CARD_LEN_HALF)
-        self.assertAlmostEqual(D.PCIE_CARD_LEN_HALF, 167.65, places=2)  # CEM literal
-        self.assertEqual(D.PCIE_COUNT, 4)  # 槽數沒有被犧牲
-        # ★ 第十輪：安裝深度要算**最凸的那個**。舊版寫 CASE_D + PCIE_BAR_T，
-        #   但最凸的是 keyhole 蘑菇柱（頸 5.5 + 頭 2.5 = 8.0），少報 3 mm。
+        self.assertAlmostEqual(D.PCIE_CARD_LEN_HALF, 167.65, places=2)
+        self.assertEqual(D.PCIE_COUNT, 4)
         self.assertAlmostEqual(
             D.rear_outer_protrusion(),
-            max(D.PCIE_BAR_T, D.PCIE_HOOK_NECK_D + D.PCIE_HOOK_HEAD_D, D.PCIE_RIB_D),
+            D.PCIE_RIB_D + D.PCIE_BAR_T,
             places=6,
         )
         self.assertAlmostEqual(
-            D.install_depth_mm(), D.CASE_D + D.rear_outer_protrusion(), places=6
+            D.install_depth_mm(),
+            D.CASE_D + D.rear_outer_protrusion(),
+            places=6,
         )
-        self.assertGreater(D.install_depth_mm(), D.CASE_D + D.PCIE_BAR_T)
 
     def test_PCIe窗框整圈補強(self):
-        """使用者主訴 4：PCIe 那邊還是很多問題。第九輪只補了三根肋。"""
         fx0, fx1 = D.pcie_frame_x()
         fz0, fz1 = D.pcie_frame_z()
-        cs = D.pcie_centers()
-        # 補強要涵蓋四個開孔的整個 X 帶
-        self.assertLessEqual(fx0, min(cs) - D.PCIE_OPEN_W / 2)
-        self.assertGreaterEqual(fx1, max(cs) + D.PCIE_OPEN_W / 2)
-        # 但不准蓋到 I/O 開孔、也不准超出機殼外表面
+        centers = D.pcie_centers()
+        self.assertLessEqual(fx0, min(centers) - D.PCIE_OPEN_W / 2)
+        self.assertGreaterEqual(fx1, max(centers) + D.PCIE_OPEN_W / 2)
         self.assertGreaterEqual(fx0, D.IO_X1)
         self.assertLessEqual(fx1, D.CASE_RIGHT)
-        # Z 要含底檻、讓開壓條
         self.assertLessEqual(fz0, D.PCIE_Z0)
-        self.assertLessEqual(fz1, D.PCIE_BAR_Z0 - D.SLIDE_FIT + 1e-9)
-        # 舌袋背後的料（第九輪 1.10）
+        self.assertAlmostEqual(fz1, D.PCIE_TIE_Z1, places=6)
         self.assertGreaterEqual(D.WALL + D.PCIE_RIB_D - D.PCIE_TANG_POCKET, 3.0)
-        # keyhole 柱的頸斷面（整條壓條掛在兩根上；第九輪 4.0×5.5 = 22）
-        self.assertGreaterEqual(D.PCIE_HOOK_NECK_W * D.PCIE_HOOK_NECK_D, 40.0)
-        self.assertGreater(D.PCIE_HOOK_HEAD_W, D.PCIE_HOOK_NECK_W + 2 * (D.PCIE_BAR_FIT + 1.0))
+        self.assertGreaterEqual((D.PCIE_TIE_H - D.MB_THREAD_MAJOR) / 2, 0.8)
 
-    def test_每一道滑槽都留了滑配(self):
-        """★ 第十輪：量出來全機配合面都是 nominal 零間隙（硬規則 19）。"""
-        # 槽深 = 舌 + 滑配；槽背後必須還剩得下最小可印壁厚
-        for tag, lip in (("底板", D.FLOOR_LIP), ("頂蓋", D.TOP_LIP)):
-            self.assertAlmostEqual(lip, D.WALL - D.GROOVE_BACK_MIN - D.SLIDE_FIT, places=6, msg=tag)
-            self.assertGreaterEqual(D.WALL - (lip + D.SLIDE_FIT), D.GROOVE_BACK_MIN - 1e-9, tag)
-        # 承載唇＝地板厚 − 舌厚 − 滑配，且仍可印
+    def test_每一道保留接合都留了滑配(self):
+        self.assertGreater(D.SLIDE_FIT, 0.0)
         self.assertAlmostEqual(
-            D.FLOOR_LEDGE_T, D.FLOOR_T - D.FLOOR_LIP_T - D.SLIDE_FIT, places=6
+            D.WALL - (D.TOP_LIP + D.SLIDE_FIT),
+            D.GROOVE_BACK_MIN,
+            places=6,
         )
-        self.assertGreaterEqual(D.FLOOR_LEDGE_T, 0.8)
-        self.assertGreaterEqual(D.FLOOR_LIP_T, 0.8)
-        # 頂蓋咬合量（第九輪只有 0.40）
         self.assertGreaterEqual(D.TOP_LIP, 1.0)
-        # 碟架頂板 ↔ 頂蓋底面：第九輪 INNER_TOP_Z 直接取 RACK_TOP_Z1 → 兩面共面
-        self.assertAlmostEqual(D.RACK_TOP_GAP, D.SLIDE_FIT, places=9)
-        self.assertGreaterEqual(D.INNER_TOP_Z, D.RACK_TOP_Z1 + D.RACK_TOP_GAP - 1e-9)
+        self.assertAlmostEqual(D.RACK_TOP_GAP, D.SLIDE_FIT, places=6)
+        self.assertAlmostEqual(D.RACK_BASE_Z1, D.HDD_Z0 - D.SLIDE_FIT, places=6)
+        side_left = D.WALL - D.SHROUD_LAP_T - D.SLIDE_FIT
+        self.assertGreaterEqual(side_left, 0.8)
+
+    def test_Rack底部格柵有連續載荷路徑(self):
+        self.assertEqual(len(D.RACK_BASE_BEAM_Y), 3)
+        self.assertEqual(D.RACK_BASE_BEAM_W, 12.0)
+        self.assertEqual(D.RACK_BASE_SPINE_W, 12.0)
+        self.assertGreater(D.RACK_BASE_Z1, D.RACK_Z0)
+        self.assertGreaterEqual(D.RACK_BASE_Z1 - D.RACK_Z0, 0.8)
         self.assertAlmostEqual(
-            D.INNER_TOP_Z,
-            max(D.ATX_Z1 + D.PSU_CLEAR_MIN,
-                D.PCIE_Z1 + D.PCIE_LIFT + D.PCIE_TIE_H,
-                D.RACK_TOP_Z1 + D.RACK_TOP_GAP,
-                D.AREA_A_TOP_Z),
-            places=9,
+            D.RACK_BASE_SPINE_X,
+            (D.RACK_X0 + D.RACK_POST_X1) / 2,
+            places=6,
         )
-        self.assertGreater(D.TOP_LIP, D.TOP_LIP - 2 * D.TOP_FIT_GAP)
+        for y in D.RACK_BASE_BEAM_Y:
+            self.assertGreaterEqual(y - D.RACK_BASE_BEAM_W / 2, D.TRAY_Y0)
+            self.assertLessEqual(y + D.RACK_BASE_BEAM_W / 2, D.HDD_Y1)
 
-    def test_底板與側板後板都要有保持力(self):
-        """使用者主訴 2b：底板與左右側板、後板之間缺卡榫。"""
-        # 底板側緣 bead：過盈必須大於滑配，否則只是裝飾
-        self.assertGreater(D.FLOOR_DETENT_DEPTH, D.SLIDE_FIT)
-        self.assertGreaterEqual(D.FLOOR_DETENT_R, 0.5)
-        self.assertEqual(D.FLOOR_DETENT_N, len(D.floor_detent_sites(True)))
-        # 過盈行程只能是全程的一小段（球長在底板後段）
-        self.assertLessEqual(
-            D.floor_detent_run_mm(), 0.2 * (D.BAY_SPLIT_Y - D.FLOOR_Y0)
-        )
-        # 左右對稱
-        for (lx, ly), (rx, ry) in zip(D.floor_detent_sites(True), D.floor_detent_sites(False)):
-            self.assertAlmostEqual(ly, ry, places=6)
-            self.assertAlmostEqual(
-                lx - (D.FLOOR_X0 + D.SLIDE_FIT), (D.FLOOR_X1 - D.SLIDE_FIT) - rx, places=6
-            )
-        # 後緣舌半球：球不得從舌的另一面戳出去
-        self.assertLessEqual(
-            2 * D.FLOOR_REAR_DETENT_R, D.FLOOR_LIP_T + D.DETENT_DEPTH + 1e-9
-        )
-        self.assertGreaterEqual(len(D.REAR_FLOOR_DETENT_X), 2)
-        # 前罩四面都有 detent（第九輪只有左右）
-        self.assertGreaterEqual(len(D.SHROUD_DETENT_Z), 3)
-        self.assertGreaterEqual(len(D.SHROUD_LAP_DETENT_X), 2)
-
-    def test_後牆的卡榫必須是單向的(self):
-        """★ 第十一輪：半球受拉會自己爬出來，後牆是受 −Y 力最多的那一面。
-
-        使用者第十輪問「你確定有做好嗎？就像頂蓋那樣可以卡住」——
-        量出來後牆往 −Y 走 12 mm 都沒有任何幾何擋住，只有八顆半球在摩擦。
-        """
-        # 楔要放得進口袋：斜坡 + 平台必須落在定位舌的長度內
-        self.assertLess(D.REAR_WEDGE_RAMP + D.REAR_WEDGE_BACK, D.REAR_TAB_D)
-        # 直角面前方要留得下一段整片舌料（缺口是自舌根往前開的，不是舌中間挖孔）
-        lig = D.REAR_TAB_D - (D.REAR_WEDGE_RAMP + D.REAR_WEDGE_BACK) - D.SLIDE_FIT / 2
-        self.assertGreaterEqual(lig, 1.0, "直角面前的舌料太薄，一拉就掰斷")
-        # 斜坡不能太陡，否則推不進去（0.6/1.5 ≈ 21.8°，snap-fit 常用 20–30°）
-        slope = math.degrees(math.atan2(D.DETENT_DEPTH, D.REAR_WEDGE_RAMP))
-        self.assertLessEqual(slope, 30.0)
-        self.assertGreaterEqual(slope, 10.0)
-        # 楔沿 Z 的高度要可印，而且比缺口小（Z 定位是槽的事）
-        self.assertGreaterEqual(D.REAR_WEDGE_H, 2.0)
-        self.assertGreater(D.DETENT_DEPTH, D.SLIDE_FIT)  # 不是裝飾
-        # 前罩／碟托盤是**刻意可徒手拆**的，它們的 detent 不准也變成單向
-        self.assertGreaterEqual(D.SHROUD_DETENT_R, 0.5)
-        self.assertGreater(D.SHROUD_DETENT_DEPTH, D.SLIDE_FIT)
+    def test_Top與Front保留可拆detent與導入(self):
+        self.assertEqual(len(D.TOP_DETENT_X), 2)
+        self.assertGreaterEqual(D.TOP_DETENT_R, 0.5)
+        self.assertGreater(D.TOP_DETENT_DEPTH, D.SLIDE_FIT)
+        self.assertLess(D.TOP_DETENT_DEPTH, D.TOP_DETENT_R)
+        self.assertEqual(D.SHROUD_LAP, 14.0)
+        self.assertEqual(D.SHROUD_LEAD_IN, 1.0)
+        self.assertEqual(2 * len(D.SHROUD_DETENT_Z) + 2 * len(D.SHROUD_LAP_DETENT_X), 10)
 
     def test_碟架推到底要有止擋(self):
         """★ 第十一輪：第十輪槽的後端開到 TRAY_Y0 − 1.0，碟架往 −Y 浮 3.00 mm。"""
@@ -587,22 +555,14 @@ class Test修復回歸(unittest.TestCase):
         self.assertLess(D.RACK_STOP_Y, max(D.RACK_BEAM_Y) - D.RACK_BEAM_W / 2)
 
     def test_組裝順序是唯一來源(self):
-        """使用者指定的順序：底板 → 側板 → 後板 → 碟架 → 頂蓋 → 前罩。"""
-        keys = [k for k, _ in D.ASSEMBLY_STEPS]
-        self.assertEqual(keys[0], "Bottom_Tray")
-        self.assertEqual(keys[1:3], ["Side_Left_MB", "Side_Right_MB"])
-        self.assertEqual(keys[3], "Rear_IO_PCIe")
-        self.assertLess(keys.index("HDD_Rack"), keys.index("Top_MB"))
-        self.assertLess(keys.index("Top_MB"), keys.index("Front_Shroud"))
-        # 每一個機殼結構件都要在表裡（漏一件就沒有人驗它裝不裝得進去）
-        need = {"Bottom_Tray", "Rear_IO_PCIe", "Side_Left_MB", "Side_Right_MB",
-                "Top_MB", "Front_Shroud", "HDD_Rack", "HDD_Tray"}
-        self.assertTrue(need <= set(keys), f"漏了 {sorted(need - set(keys))}")
-        # 底板是基準（不動）；側板往 −Y 滑上去；後板往 +Y 推進來
-        d = dict(D.ASSEMBLY_STEPS)
-        self.assertEqual(d["Bottom_Tray"], 0.0)
-        self.assertLess(d["Side_Left_MB"], 0.0)
-        self.assertGreater(d["Rear_IO_PCIe"], 0.0)
+        self.assertEqual(
+            [key for key, _ in D.ASSEMBLY_STEPS],
+            ["Chassis_Body", "HDD_Rack", "Top_MB", "Front_Shroud", "HDD_Tray"],
+        )
+        self.assertEqual(D.ASSEMBLY_STEPS[0], ("Chassis_Body", 0.0))
+        for key, distance in D.ASSEMBLY_STEPS[1:]:
+            self.assertLess(distance, 0.0, msg=key)
+        self.assertEqual(set(dict(D.ASSEMBLY_STEPS)), {"Chassis_Body", *D.STRUCT_PART_KEYS})
 
     def test_電源落入要讓開後牆頂鉤唇(self):
         # 第八輪：後牆的頂蓋承托肩刪了（頂蓋改滑入），X 向不必再讓位；
@@ -612,10 +572,11 @@ class Test修復回歸(unittest.TestCase):
         self.assertGreaterEqual(D.psu_slide_room(), D.PSU_SLIDE_X)
 
 
-    def test_列印件清單與結構鍵同源(self):
-        self.assertEqual(tuple(D.STL_NAMES), D.STRUCT_PART_KEYS)
+    def test_列印件清單與份數同源而結構鍵只列可拆件(self):
+        self.assertEqual(set(D.PART_QTY), set(D.STL_NAMES))
+        self.assertEqual(set(D.STRUCT_PART_KEYS), {"Top_MB", "Front_Shroud", "HDD_Rack", "HDD_Tray"})
         self.assertIn("PCIeBar", D.STL_NAMES)
-        self.assertIn("MB_Nut", D.STL_NAMES)
+        self.assertIn("MB_Screw", D.STL_NAMES)
         self.assertEqual(len(set(D.STL_NAMES.values())), len(D.STL_NAMES))
 
     def test_碟用底孔鎖在托盤上(self):
@@ -665,15 +626,15 @@ class Test修復回歸(unittest.TestCase):
         self.assertAlmostEqual(max(xs), D.A1_MAX, places=3)
         self.assertAlmostEqual(max(ys), D.A1_MAX, places=3)
 
-    def test_外殼接合不再有任何五金(self):
-        """第八輪改全滑槽：銅母、M3、頂蓋螺絲座、搭接片全部不存在。"""
-        for gone in ("M3_INSERT_D", "M3_TAP", "M3_CLR", "M3_INSERT_BORE",
-                     "M3_BOSS_W", "M3_BOSS_L", "CAGE_LAP_W", "TOP_SCREW_BOSS_H"):
+    def test_外殼本體一體式且PCIe壓條是唯一塑膠對塑膠五金(self):
+        for gone in (
+            "M3_INSERT_D", "M3_TAP", "M3_CLR", "M3_INSERT_BORE",
+            "M3_BOSS_W", "M3_BOSS_L", "CAGE_LAP_W", "TOP_SCREW_BOSS_H",
+        ):
             self.assertFalse(hasattr(D, gone), msg=gone)
-        # 剩下的五金只有 PSU 四顆 #6-32 與碟的底孔螺絲 —— 都是鎖在鋼件上的
         self.assertAlmostEqual(D.ATX_SCREW_CLR, 3.7, places=2)
         self.assertAlmostEqual(D.HDD_SCREW_CLR, 3.6, places=2)
-
+        self.assertEqual(len(D.pcie_lock_x()), 2)
 
     def test_頂蓋單片滑入且被互鎖(self):
         """
@@ -696,8 +657,6 @@ class Test修復回歸(unittest.TestCase):
     def test_進氣只有前柵(self):
         # 氣流一條龍：前柵（前罩下段 + 每片碟托盤的前擋板）→ 碟 → 主板腔
         #             → 電源風扇（朝下）→ 後方排出
-        import math
-
         self.assertGreaterEqual(D.front_vent_area(), math.pi * 60.0 ** 2)
         self.assertGreater(D.FRONT_VENT_PITCH, D.FRONT_VENT_SLAT)  # 條與條之間要有料
         self.assertLessEqual(D.FRONT_VENT_Z1, D.HDD_Z0)            # 下段柵在碟陣底下
@@ -834,20 +793,14 @@ class Test裝配動作(unittest.TestCase):
 
 
     def test_每個STL都有份數而且份數由既有常數導出(self):
-        """
-        第十一輪：`PRINT_VOLUME` 一直是逐件加總、沒乘份數，
-        於是文件寫的「印料 1032 cm³」少算碟托盤 ×3 與壓帽 ×8（實際 1240，差 20%）。
-        份數表必須涵蓋每個 STL（漏件 = 買料短缺），而且不准寫魔術數字。
-        """
         self.assertEqual(set(D.PART_QTY), set(D.STL_NAMES))
-        for k, n in D.PART_QTY.items():
-            self.assertIsInstance(n, int, k)
-            self.assertGreaterEqual(n, 1, k)
-        # 由既有常數導出，不是手打的數字
-        self.assertEqual(D.PART_QTY["HDD_Tray"], D.HDD_COUNT)
-        self.assertEqual(D.PART_QTY["MB_Nut"], D.MB_NUT_COUNT)
+        self.assertEqual(D.PART_QTY["Chassis_Body"], 1)
+        self.assertEqual(D.PART_QTY["HDD_Tray"], D.TRAY_COUNT)
         self.assertEqual(D.PART_QTY["PCIeBlank"], D.PCIE_COUNT)
-        # 含份數的總件數必須 > 一件一份（否則這張表沒有作用＝vacuous）
+        self.assertEqual(
+            D.PART_QTY["MB_Screw"], D.MB_SCREW_COUNT + D.PCIE_BAR_SCREW_COUNT
+        )
+        self.assertEqual(D.MB_SCREW_COUNT, len(D.HOLES_MM))
         self.assertGreater(sum(D.PART_QTY.values()), len(D.STL_NAMES))
 
     def test_每個列印件的最大投影邊都塞不下5mm_brim(self):
@@ -859,6 +812,246 @@ class Test裝配動作(unittest.TestCase):
         margin = (D.A1_MAX - D.CASE_W) / 2.0
         self.assertLess(margin, 5.0)  # 5 mm brim 放不下
         self.assertGreater(margin, 0.0)  # 但本體本身放得下
+
+
+class Test第十三輪(unittest.TestCase):
+    """使用者實印第十二輪後回報的五項；每一項都要有一條機器可驗的斷言。"""
+
+    def test_IO開孔的深度基準出自Fig4側視圖(self):
+        """
+        主訴 2：主機板／擋板裝不上。病灶不在 Z（那一直是對的），在 **Y**。
+        Fig.4 有兩張圖，前十二輪只用了正視圖；側視圖才定義深度方向的基準。
+        """
+        # 側視圖的兩個 literal
+        self.assertAlmostEqual(D.IO_APERTURE_FROM_B, 12.27, places=2)
+        self.assertAlmostEqual(D.IO_FROM_STANDOFF_TOP, 2.24, places=2)
+        # Fig.5 note：Datum B → I/O 連接器的面
+        self.assertAlmostEqual(D.IO_CONN_FACE_FROM_B, 11.30, places=2)
+        # 後牆內面 = I/O aperture 平面（不再是「板緣減 MARGIN 減 WALL」）
+        self.assertAlmostEqual(D.CASE_REAR + D.WALL, -D.IO_APERTURE_FROM_B, places=6)
+        self.assertAlmostEqual(D.CASE_REAR, -(D.IO_APERTURE_FROM_B + D.WALL), places=6)
+        # 連接器面必須落在牆的**內側**（舊值 −10.66 讓它戳進牆 0.64）
+        self.assertLess(
+            D.CASE_REAR + D.WALL, -D.IO_CONN_FACE_FROM_B,
+            "I/O 連接器的面戳進後牆料裡 —— 主板推不到底",
+        )
+        self.assertAlmostEqual(
+            (-D.IO_CONN_FACE_FROM_B) - (D.CASE_REAR + D.WALL), 0.97, places=2
+        )
+        # 連接器面比 PCB 後緣還往後突出（這正是舊 MARGIN=0.5 不夠的原因）
+        self.assertLess(-D.IO_CONN_FACE_FROM_B, D.BOARD_REAR)
+        # Z 的兩個獨立基準必須同時成立（板面 −3.81 與 standoff 頂 −2.24）
+        self.assertAlmostEqual(D.IO_Z0, D.BOARD_TOP_Z - 3.81, places=6)
+        self.assertAlmostEqual(
+            D.IO_Z0, D.SHOULDER_TOP_Z - D.IO_FROM_STANDOFF_TOP, places=6
+        )
+
+    def test_碟架承托肩取代0_9mm咬合承重(self):
+        """主訴 1：側板對應的溝槽太淺，往內伸一塊擋板把碟架托住。"""
+        # 舊承重面積：4 個支點 × 樑寬 × 咬合量
+        old_area = 4 * D.RACK_BEAM_W * (D.RACK_RAIL_T - D.SLIDE_FIT)
+        new_area = 2 * len(D.RACK_BEAM_Y) * D.RACK_BEAM_W * D.RACK_LEDGE_D
+        self.assertGreaterEqual(new_area, 10 * old_area)
+        # 肩頂比橫樑底低一個滑配：滑入時不磨，載重落 0.30 就坐實（硬規則 19）
+        self.assertAlmostEqual(D.RACK_LEDGE_Z1, D.RACK_RAIL_Z0 - D.SLIDE_FIT, places=6)
+        # 斜撐要真的是 45°（自埋入牆內的根部量起）
+        self.assertAlmostEqual(
+            D.RACK_LEDGE_GUSSET, D.RACK_LEDGE_D + D.CHASSIS_OVERLAP, places=6
+        )
+        # 整條肩遠高於三個規格淨空頂，機殼的料一點都沒有伸進主板的地盤
+        ledge_bottom = D.RACK_LEDGE_Z0 - D.RACK_LEDGE_GUSSET
+        for top in (D.AREA_A_TOP_Z, D.AREA_B_TOP_Z, D.AREA_C_TOP_Z):
+            self.assertGreater(ledge_bottom, top)
+        # Chassis 段讓開電源與 PCIe 卡的 y 帶
+        self.assertGreater(D.RACK_LEDGE_Y0, D.ATX_Y1)
+        self.assertGreaterEqual(D.RACK_LEDGE_Y0, D.RACK_STOP_Y)
+        # Chassis 段與前罩段接力，中間留滑配、不重疊
+        self.assertAlmostEqual(D.RACK_LEDGE_Y1, D.SHROUD_Y0 - D.SHROUD_LAP, places=6)
+        self.assertGreaterEqual(D.SHROUD_LEDGE_Y0, D.SHROUD_Y0)
+        self.assertAlmostEqual(D.SHROUD_LEDGE_D, D.RACK_LEDGE_D, places=6)
+        # 前罩是「無支撐」preset：貼床端的楔形引入必須是 45°
+        self.assertAlmostEqual(D.SHROUD_LEDGE_LEAD, D.RACK_LEDGE_T, places=6)
+        # 前段懸臂大幅縮短
+        self.assertLess(D.HDD_Y1 - max(D.RACK_BEAM_Y), 0.5 * (D.HDD_Y1 - D.BAY_SPLIT_Y))
+
+    def test_PCIe開孔頂改45度尖頂而且不吃抬升(self):
+        """主訴 3：拆支撐會把中間三根細桿一起扯斷。根因是那四個開孔需要支撐。"""
+        # 全寬區的頂 = 擋板抬到頂的位置，抬升一點都沒有少
+        self.assertAlmostEqual(D.PCIE_OPEN_Z1, D.PCIE_Z1 + D.PCIE_LIFT, places=6)
+        self.assertGreaterEqual(D.PCIE_LIFT, D.PCIE_ENGAGE)
+        # 45° ⇒ 尖頂高 = 半寬（切片器判定不需支撐）
+        self.assertAlmostEqual(D.PCIE_APEX_H, D.PCIE_OPEN_W / 2, places=6)
+        self.assertAlmostEqual(D.PCIE_APEX_Z, D.PCIE_OPEN_Z1 + D.PCIE_APEX_H, places=6)
+        # 繫樑移到尖頂之上，但機殼高度不變
+        self.assertAlmostEqual(D.PCIE_TIE_Z0, D.PCIE_APEX_Z, places=6)
+        self.assertAlmostEqual(D.PCIE_TIE_Z1, D.PCIE_TIE_Z0 + D.PCIE_TIE_H, places=6)
+        self.assertLess(D.PCIE_TIE_Z1, D.INNER_TOP_Z)
+        self.assertAlmostEqual(D.OUTER_TOP_Z, 180.12, places=2)
+        # 窗框補強一路長到繫樑頂（盲牙不能鑽在只有 WALL 厚的牆上）
+        self.assertAlmostEqual(D.pcie_frame_z()[1], D.PCIE_TIE_Z1, places=6)
+
+    def test_後牆補頂蓋卡槽且讓開電源與碟架(self):
+        """主訴 4：後牆好像沒有專門插頂蓋的卡槽。"""
+        self.assertAlmostEqual(D.TOP_REAR_LIP, D.TOP_LIP, places=6)
+        # 槽深與側槽同一個牆厚上限，槽背仍留可印料
+        self.assertAlmostEqual(
+            D.WALL - (D.TOP_REAR_LIP + D.SLIDE_FIT), D.GROOVE_BACK_MIN, places=6
+        )
+        bands = D.top_rear_tab_bands()
+        self.assertEqual(len(bands), 2)
+        for bx0, bx1 in bands:
+            self.assertGreater(bx1, bx0)
+        # 舌是**整條路徑掃過去**的：兩段都必須完全避開電源與碟架的 x 帶
+        for bx0, bx1 in bands:
+            self.assertFalse(bx0 < D.ATX_X1 and bx1 > D.ATX_X0, "後舌掃過電源")
+            self.assertFalse(
+                bx0 < D.RACK_POST_X1 and bx1 > D.RACK_X0, "後舌掃過碟架頂板"
+            )
+        # 鉤唇沒有被順手刪掉（它擋的是外側 +Z，與槽不是同一件事）
+        self.assertGreater(D.TOP_HOOK_D, 0.0)
+        self.assertGreater(D.TOP_HOOK_T, 0.0)
+
+    def test_前罩搭接帶改U形雙壁夾持(self):
+        """主訴 5：改成有縫隙可以插進去、兩邊夾住，不要單邊凸點卡槽。"""
+        self.assertGreaterEqual(D.SHROUD_INNER_T, 0.8)  # FDM 最小可印壁厚
+        # 內壁下限讓開 Area B 淨空（右牆內面到主板右緣只有 0.50）
+        self.assertAlmostEqual(D.SHROUD_INNER_Z0, D.AREA_B_TOP_Z + D.SLIDE_FIT, places=6)
+        self.assertGreater(D.SHROUD_INNER_Z0, D.AREA_B_TOP_Z)
+        # 內壁上限讓開碟架承托肩的 45° 斜撐底
+        self.assertAlmostEqual(
+            D.SHROUD_INNER_Z1,
+            D.RACK_LEDGE_Z0 - D.RACK_LEDGE_GUSSET - D.SLIDE_FIT,
+            places=6,
+        )
+        self.assertLess(D.SHROUD_INNER_Z1, D.RACK_LEDGE_Z0 - D.RACK_LEDGE_GUSSET)
+        self.assertGreater(D.SHROUD_INNER_Z1 - D.SHROUD_INNER_Z0, 100.0)
+        # 接合塊：內壁貼的是 Chassis 牆內面，主體壁內面比它外 1.10 —— 不接就飄
+        self.assertGreater(D.SHROUD_INNER_JOIN, 0.0)
+        gap = (D.CASE_LEFT + D.SHROUD_WALL) - (D.CASE_LEFT + D.WALL + D.SLIDE_FIT)
+        self.assertLess(gap, 0.0, "主體壁內面應該比內壁外側更外")
+        # 外壁仍在（U 形要兩片，不是把單邊搬到另一邊）
+        self.assertGreaterEqual(D.SHROUD_LAP_T, 0.8)
+        self.assertEqual(len(D.SHROUD_DETENT_Z), 3)
+
+
+class Test第十四輪(unittest.TestCase):
+    """主訴：PCIe 細肋仍被支撐扯斷／螺絲要十字孔／支撐難拆與表面粗糙。"""
+
+    def _support_preset(self):
+        import json
+        path = os.path.join(ROOT, "列印設定", "3DP-MATX 機殼件 0.16 支撐.json")
+        with io.open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def test_螺絲頭十字工具槽尺寸鏈(self):
+        """主訴 2：螺絲上面要有十字的孔，讓螺絲起子可以轉。"""
+        self.assertGreaterEqual(D.MB_SCREW_CROSS_W, 0.5)  # 最小可印特徵
+        self.assertLess(D.MB_SCREW_CROSS_L, D.MB_SCREW_HEAD_AF)
+        self.assertLess(D.MB_SCREW_CROSS_DEPTH, D.MB_SCREW_HEAD_H, "槽不得吃到牙")
+        self.assertAlmostEqual(
+            D.MB_SCREW_CROSS_WALL, (D.MB_SCREW_HEAD_AF - D.MB_SCREW_CROSS_L) / 2, places=6
+        )
+        self.assertAlmostEqual(
+            D.MB_SCREW_CROSS_ROOF, D.MB_SCREW_HEAD_H - D.MB_SCREW_CROSS_DEPTH, places=6
+        )
+        self.assertGreaterEqual(D.MB_SCREW_CROSS_WALL, 0.8)
+        self.assertGreaterEqual(D.MB_SCREW_CROSS_ROOF, 0.8)
+        # 頭仍在 keepout 內（加了槽也不能把頭放大）
+        self.assertLess(D.MB_SCREW_HEAD_D, D.MB_KEEPOUT_D)
+
+    def test_支撐門檻是preset與幾何的同一個數字(self):
+        """45° 尖頂／斜撐／引入楔只有在這個門檻下才成立（硬規則 9）。"""
+        preset = self._support_preset()
+        self.assertEqual(
+            preset["support_threshold_angle"], f"{D.SUPPORT_THRESHOLD_ANGLE:g}"
+        )
+        # 45° 幾何必須真的高於門檻，否則尖頂照樣生支撐
+        self.assertLess(D.SUPPORT_THRESHOLD_ANGLE, 45.0)
+
+    def test_脫模間隙不得小於Bambu原廠值(self):
+        """主訴 3：支撐難拆／表面粗糙。第十三輪的 0.2 比原廠 0.35 還小。"""
+        preset = self._support_preset()
+        self.assertGreaterEqual(float(preset["support_object_xy_distance"]), 0.35)
+        layer = float(preset["layer_height"])
+        for key in ("support_top_z_distance", "support_bottom_z_distance"):
+            self.assertGreaterEqual(
+                float(preset[key]), 2 * layer, f"{key} 至少兩層，PETG 一層會焊住"
+            )
+        # 接觸面要有一層才有連續下表面；底接觸面留 0（那一面焊在件上）
+        self.assertGreaterEqual(int(preset["support_interface_top_layers"]), 1)
+        self.assertEqual(int(preset["support_interface_bottom_layers"]), 0)
+
+    def test_支撐外脹量受A1床餘量限制(self):
+        """脫模間隙不是想開多大就多大 —— 支撐是印出來的料，也要佔床。
+
+        Chassis 裸深已經 252.85，床 256。第十四輪一度把 xy 開到 0.45，
+        佔床立刻 254.42 × 254.59、餘量 0.71 < 0.75 硬門檻。這條把
+        「PETG 要大間隙」與「A1 只剩 0.8 mm/邊」的衝突寫成斷言，
+        下一輪要動任一邊都會先撞到它。
+        """
+        import importlib
+        placement = importlib.import_module("列印擺位")
+        preset = self._support_preset()
+        xy = float(preset["support_object_xy_distance"])
+        grow = 2 * (xy + placement.SUPPORT_LINE_W)
+        depth = D.BAY_SPLIT_Y - (D.CASE_REAR - D.PCIE_RIB_D)
+        self.assertAlmostEqual(depth, 252.85, places=2)
+        for span in (D.CASE_W, depth):
+            self.assertGreaterEqual(
+                (placement.BED - (span + grow)) / 2, 0.75,
+                f"加支撐後 A1 餘量 < 0.75 mm/邊（xy={xy}）",
+            )
+
+    def test_PCIe窗框45度引入楔(self):
+        """主訴 1：窗框底緣本來是 89×4 的水平懸空，就在三根肋的正下方。"""
+        self.assertAlmostEqual(D.PCIE_FRAME_LEAD, D.PCIE_RIB_D, places=6)  # 45°
+        # 楔只往下長，不多凸一分 Y（A1 餘量只有 0.81 mm/邊）
+        self.assertGreater(D.pcie_frame_z()[0] - D.PCIE_FRAME_LEAD, 0.0)
+
+    def test_後牆鉤唇減深但仍咬得住(self):
+        """鉤唇底面是全寬水平懸空，支撐塔會擦過三根肋；6.0 從來沒有理由。"""
+        self.assertLessEqual(D.TOP_HOOK_D, 3.0)
+        self.assertGreater(D.TOP_HOOK_D, D.TOP_LIP, "咬合量不得低於側舌")
+        self.assertGreater(D.PSU_SLIDE_Y, D.TOP_HOOK_D)
+        # 底面做不出 45°：往下一個 GUSSET 就撞到頂蓋本體
+        self.assertLess(D.INNER_TOP_Z, D.OUTER_TOP_Z - D.TOP_HOOK_T)
+
+
+class Test註解真實性(unittest.TestCase):
+    """`# 99.22` 這種行尾註解會跟著上游一起爛掉，而且沒有任何東西在看它。
+
+    第十四輪一次抓到 8 條（`CASE_D # 301.00`、`ATX_Y0 # −10.66`、
+    `PCIE_CARD_LEN # 189.00` …），全部是第十／十三輪改上游時漏掉的。
+    註解寫錯不會讓幾何錯，但它會讓下一輪讀到假的數字（硬規則 15 的變體）。
+    """
+
+    # `NAME = expr  # 12.34`；引號結尾的是規格 literal（`0.800" TYP`），不是本地值
+    COMMENT_VALUE = re.compile(r"""^([A-Z][A-Z0-9_]*) = .*#\s*(−?-?\d+\.\d+)(?![\d"″”'])""")
+
+    def test_行尾數值註解必須等於實際值(self):
+        bad = []
+        path = os.path.join(SCRIPTS, "參數.py")
+        for lineno, line in enumerate(io.open(path, encoding="utf-8"), 1):
+            m = self.COMMENT_VALUE.match(line.rstrip())
+            if not m:
+                continue
+            name, text = m.group(1), m.group(2).replace("−", "-")
+            actual = getattr(D, name, None)
+            if not isinstance(actual, (int, float)) or isinstance(actual, bool):
+                continue
+            if abs(float(text) - float(actual)) > 0.006:
+                bad.append(f"參數.py:{lineno} {name} 註解={text} 實際={actual:.3f}")
+        self.assertEqual(bad, [], "行尾註解與實際值不符：" + " / ".join(bad))
+
+    def test_這條檢查抓得到被改壞的註解(self):
+        """非空證明（硬規則 16）：拿一行真的註解改壞，pattern 必須看得出來。"""
+        m = self.COMMENT_VALUE.match("CASE_D = CASE_FRONT - CASE_REAR  # 301.00")
+        self.assertIsNotNone(m)
+        self.assertNotAlmostEqual(float(m.group(2)), D.CASE_D, places=2)
+        # 規格 literal（吋）不算本地值，不得誤報
+        self.assertIsNone(
+            self.COMMENT_VALUE.match('PCIE_PITCH = 20.32  # 0.800" TYP between connectors')
+        )
 
 
 if __name__ == "__main__":

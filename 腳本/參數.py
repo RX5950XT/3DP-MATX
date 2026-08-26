@@ -69,32 +69,44 @@ AREA_A_STEP_X = -95.25  # intel 3.750 in：A/C 界線在此換階
 AREA_A_Y_NEAR = 154.94  # intel 6.100 in：x ≤ AREA_A_STEP_X 段的 A/C 界線
 AREA_A_Y_FAR = 180.34  # intel 7.100 in：x ∈ [STEP, B_X0] 段的 A/C 界線
 
-# --- 主板柱（階梯圓柱：Ø8 粗肩 → Ø3.50 細軸穿板 → 梯形外螺紋 + 印製螺帽）---
-# 第六輪定案，第七輪只改「柱長在底板上」而不是「長在甲板上」。三關見 CLAUDE.md 硬規則 6。
+# --- 主板固定（Ø8 支撐肩內的盲內牙 + 專用印製螺絲）---
+# Ø8 粗肩提供 microATX §2.4.2 的 6.35 mm 板底淨空；PCB 上方不再有固定於機殼的細軸。
+# 螺絲採 2.50 mm 粗牙距：5 mm 有兩圈旋合，女性牙頂約 0.85 mm，可由 0.4 nozzle 成形。
 SHOULDER_OD = 8.0
-SHOULDER_H = 6.35  # microATX 1.2 §2.4.2：機殼須讓板底 ≥0.250"(6.35)
-MB_STUD_MAJOR = 3.50  # 牙頂徑；主板孔 Ø3.96 → 單邊 0.23 滑配（PETG 建議 0.2–0.3）
-MB_STUD_DEPTH = 0.60  # 徑向牙深。牙深要扣掉螺帽間隙才是**真旋合量**：0.60 − 0.20 = 0.40
-MB_STUD_MINOR = MB_STUD_MAJOR - 2 * MB_STUD_DEPTH  # 2.30 芯徑
-MB_STUD_PITCH = 2.00  # 粗牙距。1.5 的話螺帽內牙牙頂只剩 0.175，印不出來
-MB_STUD_ROOT_W = 0.50  # 牙底寬（× pitch）
-MB_STUD_CREST_W = 0.25  # 牙頂寬（× pitch）
-MB_NUT_H = 5.0  # 旋合 2.5 圈
-MB_NUT_OD = 9.6  # < MB_KEEPOUT_D
-MB_NUT_GAP = 0.20  # 螺帽內牙相對外牙的單邊間隙（滑配）
-MB_THREAD_ENGAGE = MB_STUD_DEPTH - MB_NUT_GAP  # 0.40 真旋合徑向量
-MB_NUT_FLUTES = 12  # 外周指握溝槽數（手緊，不上工具）
-MB_NUT_FLUTE_R = 1.0
-MB_NUT_COUNT = 9  # 九孔各一顆；總成裡只放 B 孔那顆（見 build_case）
+SHOULDER_H = 6.35
+MB_THREAD_MAJOR = 3.50
+MB_THREAD_DEPTH = 0.60
+MB_THREAD_MINOR = MB_THREAD_MAJOR - 2 * MB_THREAD_DEPTH
+MB_THREAD_PITCH = 2.50
+MB_THREAD_ROOT_W = 0.50
+MB_THREAD_CREST_W = 0.25
+MB_THREAD_GAP = 0.20
+MB_THREAD_ENGAGE = MB_THREAD_DEPTH - MB_THREAD_GAP
+MB_THREAD_ENGAGEMENT = 5.0
+MB_SOCKET_END_GAP = 0.20
+MB_SOCKET_DEPTH = MB_THREAD_ENGAGEMENT + MB_SOCKET_END_GAP
+MB_SCREW_THREAD_LEN = PCB_T + MB_THREAD_ENGAGEMENT
+MB_SCREW_HEAD_AF = 8.0
+MB_SCREW_HEAD_H = 2.4
+MB_SCREW_HEAD_D = MB_SCREW_HEAD_AF / 0.8660254037844386  # 9.24，仍在 Ø10.16 keepout 內
+# 頭頂十字工具槽（第十四輪）。螺絲是**頭面貼床**印的，槽開在貼床那一面 ->
+# 槽壁落在第一層最銳利，槽頂只是 CROSS_W 寬的橋接（0.12 層高橋 1.8 mm 免支撐）。
+# 直邊十字（非 Phillips 錐面）不會 cam-out；PETG 靠的是側壁剪力不是楔緊。
+MB_SCREW_CROSS_W = 1.8
+MB_SCREW_CROSS_L = 5.6
+MB_SCREW_CROSS_DEPTH = 1.5
+MB_SCREW_CROSS_WALL = (MB_SCREW_HEAD_AF - MB_SCREW_CROSS_L) / 2
+MB_SCREW_CROSS_ROOF = MB_SCREW_HEAD_H - MB_SCREW_CROSS_DEPTH
+MB_SCREW_COUNT = len(HOLES_MM)
 MB_KEEPOUT_D = 10.16  # microATX 0.400" 九孔 keepout 直徑（規格只保證板底側）
 
 # --- 壁厚／地板／下裙 ---
 WALL = 2.4
 TOP_T = 3.0
 FLOOR_T = 2.4
-# 滑槽單邊間隙（PETG 滑配）。★ 第九輪往上搬：PCIe 壓條的 keyhole 與前罩搭接都要用它，
-#   而它們的定義比舊位置早。**零間隙不是精密，是裝不上**——第八輪前罩搭接帶
-#   nominal 0，布林 common=0.000 被讀成「不干涉」，其實是「套不進去」。
+# 滑槽單邊間隙（PETG 滑配）。目前供 Top、Front、Rack 與 HDD Tray 的配合面共用；
+# **零間隙不是精密，是裝不上**——第八輪前罩搭接帶 nominal 0，布林 common=0.000
+# 被讀成「不干涉」，其實是「套不進去」。
 SLIDE_FIT = 0.30
 # ★ 第十輪：所有滑槽的幾何常數集中到這裡（原本散在檔案下半，而 ATX_X0 要用到它們）。
 #   起因是量出來的：`distToShape(底板, 側板) = 0.0000`、後牆、頂蓋全部一樣——
@@ -104,29 +116,31 @@ SLIDE_FIT = 0.30
 #   一道滑槽的四個數字（牆厚 2.4 全部要塞進去）：
 #     舌伸出量 LIP → 槽深 = LIP + SLIDE_FIT → 槽背後剩料 = WALL − 槽深 ≥ 0.8（可印）
 #     ⇒ LIP ≤ WALL − 0.8 − SLIDE_FIT = 1.30
-GROOVE_BACK_MIN = 0.8  # 槽挖完之後牆上必須剩下的料（FDM 最小可印壁厚）
-FLOOR_LIP = WALL - GROOVE_BACK_MIN - SLIDE_FIT  # 1.30 底板側／後舌伸出量＝槽深−滑配
-FLOOR_LIP_T = 1.0  # 舌厚（Z）。★ 第十輪 1.2→1.0，讓出來的 0.2 加到下方承載唇
-FLOOR_LEDGE_T = FLOOR_T - FLOOR_LIP_T - SLIDE_FIT  # 1.10 槽下方的整厚牆料（承載唇）
-TOP_LIP = FLOOR_LIP  # 1.30 頂蓋側舌伸出量（同一條規則導出）
+GROOVE_BACK_MIN = 0.8  # 頂蓋槽挖完後牆上必須保留的可印料厚
+# 切片器的支撐判準（第十四輪）。preset `support_threshold_angle` 的**唯一來源**：
+# 斜率（自水平量起，90° = 垂直牆）小於它的朝下面才生支撐。幾何側的「45° 尖頂／
+# 45° 斜撐／45° 引入楔」全部靠這個數字才算數，所以兩邊必須同一個常數
+# （`驗切片設定.py` 直接拿它比 preset，硬規則 9）。
+SUPPORT_THRESHOLD_ANGLE = 30.0
+CHASSIS_OVERLAP = 1.0  # 一體件地板／側牆／後牆的 CSG 反向重疊
+TOP_LIP = WALL - GROOVE_BACK_MIN - SLIDE_FIT  # 1.30，頂蓋側舌咬合量
 TOP_FIT_GAP = 0.4  # 頂蓋本體四周單邊間隙
-TOP_FUSE = 1.0  # 舌與本體的體積重疊（只有面接觸 fuse() 不會併成單一 Solid，硬規則 1）
+TOP_FUSE = 1.0  # 舌與本體的體積重疊
 # ★ 第八輪：**下裙整個刪掉**（SKIRT_H = 0，參數保留給 negtest 對照）。
-#   下裙唯一的存在理由是「機殼內部沒有地方放 M3 銅母座」——這一輪改成
-#   全滑槽組裝、**一顆螺絲都不用**（使用者要求），座沒了，裙也就沒有理由了。
-#   直接省 10 mm 高度。機殼底面就是底板下表面，整片落地。
+#   下裙唯一的存在理由是「機殼內部沒有地方放 M3 銅母座」；現在主機殼是一體式，
+#   可拆外殼件沿用滑配，沒有任何結構螺絲需要下裙承座。PCIeBar 的兩顆外側 #6-32
+#   鎖在後牆補強座，與下裙無關。機殼底面就是地板下表面，整片落地。
 SKIRT_H = 0.0
 
-# 主板柱：粗肩直接長在底板頂面上
+# 主板支撐肩：直接長在一體式地板上；盲孔底仍保留 1.15 mm 實料
 SHOULDER_TOP_Z = FLOOR_T + SHOULDER_H  # 8.75
+MB_SOCKET_BOTTOM_Z = SHOULDER_TOP_Z - MB_SOCKET_DEPTH  # 3.55
+MB_SOCKET_BOTTOM_MATERIAL = MB_SOCKET_BOTTOM_Z - FLOOR_T  # 1.15
 BOARD_TOP_Z = SHOULDER_TOP_Z + PCB_T  # 10.32
-# 細軸露出粗肩頂的長度＝板厚 + 螺帽 + 導入／收尾餘量（由三者導出，不另寫死）
-MB_STUD_LEN = PCB_T + MB_NUT_H + 1.0
-MB_STUD_TOP_Z = SHOULDER_TOP_Z + MB_STUD_LEN
-MB_NUT_Z0 = BOARD_TOP_Z  # 螺帽底面壓在板面上
+MB_SCREW_HEAD_TOP_Z = BOARD_TOP_Z + MB_SCREW_HEAD_H
 
 # 三個分區的「機殼淨空頂面」——機殼在該區的料只能在這個 z 以上
-AREA_A_TOP_Z = BOARD_TOP_Z + AREA_A_CLEARANCE  # 99.22
+AREA_A_TOP_Z = BOARD_TOP_Z + AREA_A_CLEARANCE  # 86.52
 AREA_B_TOP_Z = BOARD_TOP_Z + AREA_B_CLEARANCE  # 25.56
 AREA_C_TOP_Z = BOARD_TOP_Z + AREA_C_CLEARANCE  # 48.42
 
@@ -191,6 +205,21 @@ IO_X0 = IO_X1 - IO_W  # −211.99
 IO_Z0 = BOARD_TOP_Z - IO_BOTTOM_BELOW_BOARD_TOP  # 6.51
 IO_Z1 = IO_Z0 + IO_H  # 50.96
 IO_CHAMFER = 0.6  # 外側插入倒角（助 I/O shield 滑入）
+# ★ 第十三輪：Figure 4 有**兩張圖**，前十二輪只用了正視圖。側視圖（p14 下半）
+#   才是深度方向的基準，而且它同時給了 Z 的第二基準：
+#     `.088±.010 [2.24±0.25] From bottom surface of motherboard or top of chassis standoffs`
+#         → 支撐肩頂 8.75 − 開孔底 6.51 = 2.24 ✓ Z 一直是對的
+#     `0.483±.010 [12.27±0.25]`  Datum B → 後牆（I/O aperture 平面）
+#   再配 Figure 5 note：`.445±.008 [11.30±0.2]` Datum B → **I/O 連接器的面**，
+#   也就是連接器面比 PCB 後緣（10.16）還往後突出 1.14 mm。
+#   第七～十二輪 `CASE_REAR = BOARD_REAR − MARGIN − WALL` 讓後牆內面落在 −10.66，
+#   連接器面 −11.30 **戳進牆 0.64 mm** —— 主板推不到底，使用者實印時看到的
+#   「I/O 開孔高度對不上」其實是 Y 差 1.61 mm。`MARGIN = 0.5` 是隨手取的，
+#   從來沒有對過這張側視圖（與第七輪孔位同一類：讀了正視圖標註、沒對側視圖基準）。
+IO_FROM_STANDOFF_TOP = 2.24  # Fig.4 側視 .088±.010（IO_Z0 的第二基準，供對照）
+IO_APERTURE_FROM_B = 12.27  # Fig.4 側視 0.483±.010：Datum B → I/O aperture 平面
+IO_CONN_FACE_FROM_B = 11.30  # Fig.5 note：Datum B → I/O 連接器的面
+IO_CONN_DEPTH = 30.0  # 連接器本體自面往板內的虛擬件深度（堆疊 RJ45/USB 典型值）
 
 # PCIe — 原廠全高金屬擋板。全部數字出自 參考/PCI_Express_CEM_r2.0.pdf
 #   Fig.6-4（p95）擋板：全長 120.02、寬 18.42、料厚 0.86(20GA)、本體 112.75、底舌 7.27×14.30
@@ -228,8 +257,11 @@ PCIE_TANG_POCKET = 1.3  # 舌槽自後牆內面往外挖的深度（>0.86 料厚
 # ★ 第九輪：繫樑 3.0 → 6.0。它在第八輪只活在 INNER_TOP_Z 的 max() 裡，
 #   幾何上被「抬升帶連續橫縫」整條切掉了 —— 三根 1.42 的肋因此變成
 #   自由長 112.75 mm 的懸臂（斷面 1.42×2.40，k≈0.006 N/mm，10 N 就位移一公尺）。
-#   橫縫已刪（壓條改 keyhole 固定，不再需要沿 X 滑），繫樑恢復成真的料。
-PCIE_TIE_H = 6.0  # 開孔上方的連續繫樑：肋的**上端固定端**
+#   第八輪的橫縫已刪；第十二輪改成卸下兩顆外側 #6-32 後，壓條沿 −Y 整片抽離，
+#   不再需要沿 X 滑動，繫樑恢復成真的料。
+# ★ 第十三輪：6.0 → 6.5。繫樑頂面現在要鑽兩個 MB_SOCKET_DEPTH 深的盲內牙
+#   （壓條的鎖點，見 PCIE_BAR_*），6.0 只剩 0.80 孔底料，6.5 才有 1.30。
+PCIE_TIE_H = 6.5  # 開孔上方的連續繫樑：肋的**上端固定端** + 壓條鎖點
 # ★ 第十輪：加厚的範圍從「只有肋」擴大到**整圈窗框**（使用者：PCIe 還是很多問題）。
 #   第九輪把三根肋補到 1.42×6.40，但窗框的其他三邊還是 2.4：
 #   底檻（舌袋挖掉 1.3 之後只剩 **1.1**）、左右柱、繫樑。一個 80×120 的洞開在
@@ -237,6 +269,12 @@ PCIE_TIE_H = 6.0  # 開孔上方的連續繫樑：肋的**上端固定端**
 #   往**機殼外**長不吃任何內部淨空（外面除了壓條什麼都沒有），
 #   而且底檻加厚之後舌袋剩料 1.1 → 5.1，擋板的 Y 定位面終於不是一層皮。
 PCIE_RIB_D = 4.0  # 窗框（含肋）往機殼外加厚（斷面 1.42×2.40 → 1.42×6.40，I ×19）
+# ★ 第十四輪：窗框底緣加 45° 引入楔。窗框自後牆外面往 −Y 凸 PCIE_RIB_D，底面
+#   （z = pcie_frame_z()[0]）本來是 89.4 × 4.0 的水平懸空，就在三根肋的正下方，
+#   支撐塔從床長到 8.68 且與窗框外面焊在一起 —— 撬它就是在撬肋的根部。
+#   楔的斜面自牆面 z0 − PCIE_RIB_D 升到窗框底，剛好 45°，不吃任何額外包絡
+#   （Y 仍止於 CASE_REAR − PCIE_RIB_D，A1 餘量 0.96 mm/邊不受影響）。
+PCIE_FRAME_LEAD = PCIE_RIB_D
 PCIE_FRAME_M = 8.0  # 窗框補強在四個開孔之外往左右各延伸的量
 PCIE_HOLD_GAP = 0.4  # 裝好後擋板頂緣→防上抬面的間隙
 # 卡要離開連接器必須整片抬「指入深度」：連接器頂 7.90（Fig.6-17）− 卡底 3.40 = 4.50
@@ -256,56 +294,46 @@ PCIE_CARD_LEN_HALF = 167.65  # CEM r2.0 §6：half-length add-in card（literal�
 PCIE_BLANK_T = 1.6
 PCIE_BLANK_EAR = 8.0
 
-# --- PCIe 卡固定：可拆壓條 ---
-# 耳下方只剩 4.56 − 4.50 = 0.06 mm，任何固定料都會擋死卡的裝拆 → 固定件必須可拆。
-# ★ 第七輪：電源移到上方後，後牆在 x ≤ −63.09、z 102–188 全被電源佔住，
-#   第六輪那兩顆凸座（x = −53.28 / −69.28）有一顆落在電源本體裡。
-#   凸座改成 **1 顆**，放在「電源右緣 → 最左開孔」之間那條 16.8 mm 的空帶；
-#   右端仍用舌片插右側板口袋（末槽耳緣 33.34 → 右內牆 34.79 只剩 1.45 mm）。
-# ★ 第八輪：壓條**移到機殼外面**（使用者：「PCIe 壓條通常長在機殼外面，不是往內突出」）。
-#   第七輪那條是往內伸 9 mm 的橫樑 + 一顆內凸座，吃內部空間、還擋住電源橫移。
-#   新做法：後牆**外表面**凸出一條沿 X 的 T 軌（＝使用者說的「凸出來的結構」），
-#   壓條自機殼右外側水平滑上去，內側面的四個舌穿過開孔頂那 6 mm（本來就是給卡抬升的
-#   讓位帶）壓在擋板頂緣上。舌只伸入 3.4（牆厚 2.4 + 1.0），**機殼內部沒有任何料**。
-# ★ 第九輪：**T 軌 + 沿 X 滑入** 整組刪掉。
-#   T 軌本身沒問題，問題是它逼出來的那條「連續橫縫」：壓條的四個壓舌要沿 X 走完
-#   全程，就得把四個開孔之間 1.42 的肋在 z∈[129.43, 135.43] 全部切斷 ——
-#   三根肋因此變成 112.75 mm 的懸臂。**修「壓條抽不出來」的動作造成了「肋懸空」。**
-#   新做法：壓條**直接往 +Y 壓上去**（四個舌各自進自己的開孔，不必沿 X 走），
-#   再**往下落 PCIE_BAR_DROP**，兩顆蘑菇柱的頭就被壓條的窄槽咬住（keyhole／鑰匙孔）。
-#   拆：抬 3.5 mm、往 −Y 拔。肋一根都不用切。
-PCIE_BAR_T = 5.0  # 壓條板厚（沿 Y，長在機殼外）
-# 舌只要蓋住擋板（擋板在牆內面的口袋裡，y 到 CASE_REAR+WALL−PCIE_TANG_POCKET+料厚），
-# **不可以伸出後牆內面**，否則就變回「往機殼內突出」了（使用者主訴）。
-PCIE_BAR_TAB_D = 2.0  # 自後牆外表面往內：蓋滿擋板 0.86 料厚仍留在牆體內
-PCIE_BAR_TAB_H = 3.0  # 舌厚（Z）
-PCIE_BAR_TAB_W = PCIE_BRACKET_W - 2.0  # 16.42 舌寬（落得進 18.9 開孔）
-PCIE_BAR_Z0 = PCIE_Z1 + PCIE_HOLD_GAP  # 129.83 舌底面＝防上抬面
-PCIE_BAR_Z1 = PCIE_BAR_Z0 + PCIE_BAR_TAB_H  # 132.83
-PCIE_BAR_DROP = 3.5  # keyhole 落差：壓上去之後往下滑這麼多才咬住
-PCIE_BAR_FIT = 0.3  # 壓條槽 ↔ 蘑菇柱的單邊滑配
-# ★ 開孔頂的抬升帶要同時滿足兩件事，取大的那個（導出，不是挑的）：
-#   ①卡要離開連接器得整片抬 PCIE_ENGAGE（+1.5 操作餘裕）
-#   ②壓條解鎖時整條往上抬 PCIE_BAR_DROP，四個舌也跟著上去，不能頂到開孔頂
-PCIE_LIFT = max(
-    PCIE_ENGAGE + 1.5,
-    PCIE_HOLD_GAP + PCIE_BAR_TAB_H + PCIE_BAR_DROP + 0.6,
-)  # 7.50
-# 蘑菇柱（keyhole 的公件）：長在後牆**外**表面、開孔頂之上的連續實料帶。
-# 頸窄頭寬；壓條上的槽是「上寬下窄」，頭自寬口穿過、落下後被窄段扣住。
-# ★ 第十輪：頸 4.0→8.0、頭 9.0→16.0。整條壓條（連同四片卡的防上抬）就掛在這兩根
-#   柱子上，4.0×5.5 的斷面是整個 PCIe 區最細的地方 —— 使用者說「只靠一點點地方
-#   連接」，這兩根就是那「一點點」。柱底在開孔頂之上、後牆全寬實料帶，加寬不花代價。
-PCIE_HOOK_NECK_W = 8.0  # 頸寬（X）
-PCIE_HOOK_HEAD_W = 16.0  # 頭寬（X）；兩側各多出 4.0 的翼 → 翼可彈，detent 就長在翼上
-# ★ 頭高必須 ≤ 落差，否則「抬起來讓頭穿過寬口」與「落下後被窄段擋住」兩件事
-#   在同一個 Z 上矛盾（推導見 verify 的 keyhole 行程檢查）。
-PCIE_HOOK_H = 3.0  # 頸／頭高（Z）
-PCIE_HOOK_FUSE = 0.2  # 頭與頸的體積重疊（只有面接觸 fuse() 不會併成單一 Solid）
-PCIE_HOOK_NECK_D = PCIE_BAR_T + PCIE_BAR_FIT + PCIE_HOOK_FUSE  # 5.50
-PCIE_HOOK_HEAD_D = 2.5  # 頭再往 −Y 凸出
-PCIE_HOOK_Z0 = PCIE_Z1 + PCIE_LIFT + 2.0  # 138.93 柱底（開孔頂之上，全寬都是實料）
-PCIE_BAR_Z1_TOP = PCIE_HOOK_Z0 + PCIE_HOOK_H + 4.0  # 145.93 壓條頂緣（槽上方留 4 mm 料）
+# --- PCIe 卡固定：外置共享壓條 + 兩顆標準螺絲 ---
+# CEM 折耳下只有 0.06 mm 永久固定料餘量，因此固定件仍必須先拆，卡才能抬升 4.50 mm。
+# 第十二輪刪除 keyhole／蘑菇柱：實印無法可靠固定，而且 8 mm 後凸使一體件支撐後超出 A1。
+PCIE_BAR_T = 5.0  # 保留厚共享壓條，避免把 102 mm 跨距削成軟薄片
+PCIE_BAR_TAB_D = 2.0
+PCIE_BAR_TAB_H = 3.0
+PCIE_BAR_TAB_W = PCIE_BRACKET_W - 2.0
+PCIE_BAR_Z0 = PCIE_Z1 + PCIE_HOLD_GAP
+PCIE_BAR_Z1 = PCIE_BAR_Z0 + PCIE_BAR_TAB_H
+PCIE_LIFT = PCIE_ENGAGE + 1.5  # 6.00：卡離開連接器 4.50 + 操作餘量
+
+# ★ 第十三輪：開孔頂改 **45° 尖頂**（使用者：拆支撐會把中間三根細桿一起扯斷）。
+#   病灶不是肋不夠粗，是那四個開孔**需要支撐**：開孔頂 z=135.43 是 18.9 mm 寬的
+#   水平懸空，切片器在四個 118 mm 深的槽裡各長一根支撐塔，塔與 1.42 mm 的肋
+#   互相咬死，拆的時候橫向力全部由肋承受。把開孔頂做成 45°，切片器判定不需支撐 →
+#   **根本不用拆**。順手的副作用：三根肋的上端由三角形連成桁架，比矩形繫樑更剛。
+#   尖頂**自擋板抬到頂的位置起算**，全寬區一點都沒有少（抬升 6.00 不受影響）。
+PCIE_OPEN_Z1 = PCIE_Z1 + PCIE_LIFT  # 135.43 全寬開孔頂＝擋板抬到頂的頂緣位置
+PCIE_APEX_H = PCIE_OPEN_W / 2  # 9.45：45° ⇒ 尖頂高＝半寬
+PCIE_APEX_Z = PCIE_OPEN_Z1 + PCIE_APEX_H  # 144.88 尖頂頂點
+PCIE_TIE_Z0 = PCIE_APEX_Z  # 繫樑底＝尖頂頂點
+PCIE_TIE_Z1 = PCIE_TIE_Z0 + PCIE_TIE_H  # 151.38 繫樑頂＝壓條鎖點所在面
+
+# --- 壓條鎖固：印製盲內牙 + 沿用 MB_Screw（第十三輪；使用者：壓條根本沒有用）---
+# 舊做法是兩顆 **#6-32 自攻**進 PETG 的 Ø2.8 盲 pilot —— 保持力全靠塑膠被鋼牙擠開，
+# 鎖第二次就滑牙。改成與主板固定同一套已驗證的 ruled-loft 印製盲內牙，配 `MB_Screw`。
+#
+# ★ 軸向為什麼還是 −Y（而不是列印品質更好的 +Z）：垂直盲牙的螺絲頭必須落在
+#   後牆**外表面之外**，Ø9.24 的頭要 4.62 的 Y 半徑，繫樑只有 WALL + PCIE_RIB_D
+#   = 6.40 厚 —— 補到放得下就得往 −Y 再凸 3 mm 以上，而 Chassis 的 Y 只剩
+#   0.96 mm/邊 的 A1 餘量（實測凸 2.5 就是 255.4 裸深，加支撐直接超床）。
+#   機殼的尺寸不能為了一個鎖點被撐爆，所以維持 −Y，靠「真的有牙」而不是靠自攻。
+# ★ 螺絲不新增第九種 STL 的條件是**夾持厚 = PCB_T**：壓條在鎖點處挖沉頭凹，
+#   凹底剩 PCIE_BAR_SEAT_T，螺絲頭沉進去（後凸也因此比舊版少 3 mm）。
+PCIE_BAR_SCREW_COUNT = 2
+PCIE_BAR_SEAT_T = PCB_T  # 1.57 壓條在鎖點的剩餘厚 ＝ MB_Screw 的夾持厚
+PCIE_BAR_HOLE_D = PCB_HOLE_D  # 3.96 與主板孔同級的通孔
+PCIE_BAR_CBORE_D = MB_SCREW_HEAD_D + 0.6  # 9.84 沉頭凹（六角頭 8 mm AF 轉得動）
+PCIE_LOCK_Z = (PCIE_TIE_Z0 + PCIE_TIE_Z1) / 2  # 148.13 盲牙軸＝繫樑中間高度
+PCIE_BAR_Z1_TOP = PCIE_TIE_Z1  # 壓條本體頂＝繫樑頂（蓋住鎖點）
 
 # ============================================================================
 # HDD — 第八輪：**平躺 4 層堆疊，疊在主板前段的正上方**（不再是機殼前方的直立碟艙）
@@ -379,14 +407,14 @@ RACK_TOP_Z1 = HDD_TOP_Z + RACK_TOP_T  # 176.82 碟架頂面＝內頂面（頂蓋
 RACK_TOP_GAP = SLIDE_FIT
 INNER_TOP_Z = max(
     ATX_Z1 + PSU_CLEAR_MIN,
-    PCIE_Z1 + PCIE_LIFT + PCIE_TIE_H,
+    PCIE_TIE_Z1,
     RACK_TOP_Z1 + RACK_TOP_GAP,
     AREA_A_TOP_Z,
 )
 OUTER_TOP_Z = INNER_TOP_Z + TOP_T
-# 電源頂上實際剩下的空氣（導出）。第九輪是 27.50 的死空間，第十輪是 1.30 的餘裕，
+# 電源頂上實際剩下的空氣（導出）。第九輪是 27.50 的死空間，第十輪起是個位數的餘裕，
 # 中間那 26.20 mm 全部變成板上的散熱器淨空（50.00 → 76.20）。
-PSU_CLEAR_ABOVE = INNER_TOP_Z - ATX_Z1  # 1.30
+PSU_CLEAR_ABOVE = INNER_TOP_Z - ATX_Z1  # 1.60
 
 # 外殼 XY：主板艙 + 前方碟艙 → 單一長方體投影
 # ★左壁不可貼板緣：I/O 開孔遠緣（IO_X0）比板左緣還外 2.44 mm，
@@ -395,7 +423,11 @@ MARGIN = 0.5
 IO_EDGE = 3.5  # I/O 開孔外緣 → 機殼外表面的板料（≥ keepout 2.54 + 可印全厚邊）
 CASE_LEFT = min(BOARD_LEFT - MARGIN - WALL, IO_X0 - IO_EDGE)  # −215.49
 CASE_RIGHT = BOARD_RIGHT + MARGIN + WALL  # +37.19
-CASE_REAR = BOARD_REAR - MARGIN - WALL  # −13.06
+# ★ 第十三輪：後牆的深度**不是**由板緣加餘量決定的，是由 Fig.4 側視的
+#   `Datum B → I/O aperture 平面 = 12.27` 決定（見 IO_APERTURE_FROM_B 的註解）。
+#   舊式 `BOARD_REAR − MARGIN − WALL` 得到 −13.06、內面 −10.66，比連接器面
+#   −11.30 還要往前 0.64 —— 板根本推不到底。內面就是 aperture 平面。
+CASE_REAR = -(IO_APERTURE_FROM_B + WALL)  # −14.67（內面 −12.27 = aperture 平面）
 CASE_W = CASE_RIGHT - CASE_LEFT  # 252.68
 
 # 擋板落位後所在的 Y 帶：舌尖坐進後牆內面的口袋，袋底即 Y 定位面
@@ -416,82 +448,44 @@ FLOOR_Y0 = CASE_REAR + WALL
 TOP_LID_INNER_X = FLOOR_X0 + TOP_FIT_GAP + TOP_FUSE  # −211.69 頂蓋下垂料的最內側
 ATX_X0 = TOP_LID_INNER_X + PSU_FIT_GAP  # −210.89
 ATX_X1 = ATX_X0 + ATX_W  # −60.89（仍 < AREA_B_X0 −52.07 → 投影整片在 Area A）
-ATX_Y0 = CASE_REAR + WALL  # −10.66（PSU 後面＝安裝面）
-ATX_FRONT_Y = ATX_Y0 + ATX_D  # 129.34 標稱前緣（線束出口）
-ATX_Y1 = ATX_Y0 + ATX_D_ALLOW  # 149.34 艙深極限（長機身）
+ATX_Y0 = CASE_REAR + WALL  # −12.27（PSU 後面＝安裝面）
+ATX_FRONT_Y = ATX_Y0 + ATX_D  # 127.73 標稱前緣（線束出口）
+ATX_Y1 = ATX_Y0 + ATX_D_ALLOW  # 147.73 艙深極限（長機身）
 
 # 機殼前緣：碟托盤前擋板的外表面就是機殼前面（托盤前擋板＝前面板的一部分）
 TRAY_FRONT_GAP = 1.0  # 碟前緣 → 托盤前擋板內面（線頭不在這側，只留裝配餘裕）
 CASE_FRONT = HDD_Y1 + TRAY_FRONT_GAP + TRAY_FACE_T  # 287.94
-CASE_D = CASE_FRONT - CASE_REAR  # 301.00
+CASE_D = CASE_FRONT - CASE_REAR  # 302.61
 # 底板／側板／頂蓋只做到 BAY_SPLIT_Y（見檔尾）——A1 床 256 放不下 299 長的件。
 
 # ============================================================================
-# 全滑槽組裝（第八輪：**一顆機殼螺絲都沒有**，使用者要求）
+# 第十二輪外殼接合：一體式 Chassis_Body + 可拆滑配件
 # ============================================================================
-# ★ 第十輪：互鎖鏈改成**使用者指定的組裝順序**，底板是基準、後牆是最後一件：
-#   ① 底板放在桌上（基準）
-#   ② 左右側板自 +Y **往 −Y 水平滑上底板**（側板內面的低位槽咬住底板兩側的舌），
-#      滑到最後 FLOOR_DETENT_RUN mm 時側緣的縱向 bead 落進側板的凹槽 → 卡住
-#   ③ 後牆自 −Y **往 +Y 推進去**：兩端的定位舌插進側板後端的口袋（detent ×3／側），
-#      同時底板後緣的舌插進後牆內面的低位槽（detent ×2）→ 三片互鎖成一個 U
-#   ④ 電源自 +Z 落入（先前移 PSU_SLIDE_Y 讓開後牆頂鉤唇）、主板／PCIe 卡裝好
-#   ⑤ 碟架自 +Y 滑入側板槽 → ⑥ 頂蓋自 +Y 滑入側板頂槽，後端鑽進後牆頂鉤唇下方
-#   → ⑦ 前罩自 +Y 套上（四面半搭接 + detent）→ ⑧ 碟托盤自 +Y 插入
-#   第八／九輪寫的是「後牆先落下、側板後落下」，與使用者的順序相反；
-#   幾何上兩種都通得過，但文件講的是一套、掃描驗的是另一套，遲早會對不起來。
-# 最後的保持力**不用 snap-fit 柱**（CLAUDE.md：實印會從層間斷掉），
-#   改用**側向半球 detent**：凸半球受的是面內剪力，不是層間拉力。
-# 滑槽的四個數字（FLOOR_LIP／FLOOR_LIP_T／FLOOR_LEDGE_T／TOP_LIP）已移到檔案上方，
-#   因為 ATX_X0 要用到 TOP_FIT_GAP。方向仍是「底板插進牆」不是「牆插進底板」：
-#   主板佔滿內腔（右 0.50／後 1.00），板底 6.35 淨空又封死 z∈[2.4, 8.75] →
-#   從底板往上長的唇會直接戳進主板。
-# ★ 角落**不能用燕尾**：燕尾大端要 6–8 mm，而牆厚只有 2.4 —— 兩片 2.4 的板
-#   在角落咬不住任何燕尾。改用「薄定位舌（X 定位）+ 半球 detent（保持力）」。
-REAR_TAB_T = 1.2  # 後牆兩端往前伸的定位舌厚
-REAR_TAB_D = 4.0  # 定位舌沿 Y 伸出長度
-REAR_DETENT_Z = (40.0, 100.0, 155.0)  # 定位舌上的 detent 高度（避開電源承托肩 86.52–89.52）
-# ★ 第十一輪：後牆的六顆 detent 從**半球**改成**不對稱楔形（斜面進、直面擋）**。
-#   第十輪量出來的真相表：後牆往 −Y 拉，>12 mm 都沒有任何幾何擋住 ——
-#   八顆半球是唯一的阻力，而半球在受拉時會**自己爬出來**（cam-out）。
-#   後牆正是 AC 線、I/O 線、PCIe 卡拔插時受 −Y 力的那一面。
-#   純滑動接合的公母**進出走的是同一道邊**，所以不對稱只能做在**公件**上：
-#     公件（側板口袋底的楔）：−Y 面是斜坡（舌前緣爬上去）、+Y 面是直角（拉不出來）
-#     母件（後牆定位舌上的孔）：單純一個孔，不需要方向性
-#   拆機時先卸前罩→抽頂蓋→側板往 +Y 滑走，楔跟著側板一起離開 → 後牆自然鬆開。
-#   底板後舌那兩顆**維持半球**：它們若也做成直角，後牆就永遠拆不下來
-#   （拉不出、又被槽鎖住抬不起）。留一組可 cam-out 的當作拆卸路徑。
-#   母件是**自舌根往前開的缺口**，不是舌中間的孔：直角面推的是缺口的前緣，
-#   那前緣必須被整片舌料頂著。開在舌中間的話，前緣只剩 0.45 mm 的細肉，
-#   一拉就把它掰斷 —— 卡榫看起來有、實際上是一次性的。
-REAR_WEDGE_RAMP = 1.5  # 斜坡長（沿 +Y；斜坡起點＝側板後端面，坡度 21.8°）
-REAR_WEDGE_BACK = 0.8  # 峰頂平台長（列印時不要收成尖角）
-REAR_WEDGE_H = 5.0  # 楔沿 Z 的高度（缺口比它高 → Z 讓位，Z 定位是槽的事不是楔的事）
-# ★ 半徑受**定位舌厚度**限制：球是整顆球不是半球，球心埋進 R−DEPTH 之後，
-#   另一端還要留在舌體內 → 2R ≤ REAR_TAB_T + DETENT_DEPTH = 1.8 → R ≤ 0.9。
-#   R 取 1.2 的話球會從舌的內表面戳出來 0.6，直接插進電源本體（實測 1.1 mm³）。
-DETENT_R = 0.9  # 半球 detent 半徑（≥0.5 最小可印特徵；受的是面內剪力不是層間拉力）
-# ★ 球心要**內移** R − DEPTH，凸出量才是 0.6。球心放在表面上的話過盈就是整個
-#   半徑 1.2，PETG 擠不過去（而且滑入掃描會一直紅在設計意圖上）。
-DETENT_DEPTH = 0.6  # 實際凸出／坑深（靠料的彈性爬過去）
-# ★ 第十輪新增：**底板 ↔ 側板**的保持力（使用者主訴 2b「底板與左右側板之間缺卡榫」）。
-#   這一條的難處是**行程 244.84 mm**：球長在誰身上都會一路磨。解法是
-#   「球長在**不動的底板**上、而且靠近底板後端」——側板的槽是自它的**後端**開始
-#   掃過球的，所以只有最後 FLOOR_DETENT_RUN mm 才有過盈。
-#   形狀用**沿 Z 的半圓 bead**不是半球：可用高度只有承載唇那 1.10 mm，
-#   半球會被壓成一顆極小的球（R ≤ 0.55，低於最小可印特徵 0.5 的邊緣）。
-FLOOR_DETENT_R = 0.9  # bead 半徑（軸沿 Z）
-FLOOR_DETENT_DEPTH = 0.6  # 凸出底板側緣的量（其中 SLIDE_FIT 是間隙，其餘是過盈）
-FLOOR_DETENT_RUN = 12.0  # bead 中心距底板後緣 → 也就是過盈行程長度
-FLOOR_DETENT_N = 2  # 每側兩顆（前後排開，兩顆之間 FLOOR_DETENT_PITCH）
-FLOOR_DETENT_PITCH = 18.0
-# 底板後緣舌 ↔ 後牆槽：後牆只推 +Y 幾 mm，行程短 → 用半球就好。
-# 球長在**底板的舌**上（純加料）、坑挖在**後牆槽的頂面**（那上面整片都是牆，挖得起）。
-# 半徑由「球不得從舌的另一面戳出去」導出：2R ≤ FLOOR_LIP_T + DETENT_DEPTH。
-REAR_FLOOR_DETENT_X = (-150.0, -20.0)  # 兩顆，避開主板柱與 I/O 區
-FLOOR_REAR_DETENT_R = (FLOOR_LIP_T + DETENT_DEPTH) / 2  # 0.80
-TOP_HOOK_D = 6.0  # 後牆頂鉤唇往前伸出（頂蓋後端鑽進它下方 → 頂蓋不能上抬）
-TOP_HOOK_T = 1.5  # 鉤唇厚（＝TOP_T 的一半；頂蓋後端同樣只留下半 → 半搭接）
+# Chassis_Body 已把地板、左右牆與後牆用 CHASSIS_OVERLAP 融成單一列印件；
+# 第十／十一輪只服務四件式 Chassis 的舌、bead、楔與 detent 已退役並由 verify 防回歸。
+# 現役可拆鏈的唯一來源是檔尾 ASSEMBLY_STEPS：Rack → Top → Front → HDD Tray。
+# Top／Front／Rack／Tray 的滑槽仍共用 SLIDE_FIT；牆厚 2.4 放不下燕尾，薄舌槽的
+# 咬合量必須同時保留 GROOVE_BACK_MIN 的槽背牆料。
+# ★ 第十四輪：6.0 → 3.0。鉤唇底面是**全寬 248 mm 的水平懸空**，切片器要從床
+#   一路長 176 mm 的支撐塔貼著後牆內面上來，而那面正是三根 1.42 肋的內側 ——
+#   使用者實印時「拆支撐把三根細桿一起扯斷」扯的就是這片塔（實測朝下面積
+#   1487 mm²，全 Chassis 第二大，且是唯一橫跨整個 PCIe 開孔區的）。
+#   底面無法做 45° 自撐：往下 4.5 mm 就是頂蓋本體（INNER_TOP_Z 177.12、TOP_T 3.0），
+#   斜撐會把頂蓋後緣整片吃掉。只能減深 —— 而 6.0 本來就說不出它擋住什麼：
+#   側舌真正的咬合量只有 TOP_LIP = 1.30，3.0 已是它的 2.3 倍。
+TOP_HOOK_D = 3.0  # 後牆頂鉤唇往前伸出；頂蓋後端鑽入其下
+TOP_HOOK_T = 1.5
+# ★ 第十三輪：後牆補一道**與側槽同 z 帶**的頂蓋槽（使用者：後牆好像沒有卡槽）。
+#   第十二輪後方只有 `TOP_HOOK` 鉤唇，它限制的是 +Z；頂蓋往 −Y 推到底時
+#   **沒有任何面擋住它**，六向保持力表裡 −Y 那一格靠的是兩顆 detent 的摩擦。
+#   槽底面就是 −Y 止擋，而且頂蓋後緣從此是被夾住的舌，不是一條懸空邊。
+#   鉤唇保留：兩者 z 帶不重疊（唇 178.62–180.12、槽 174.12–177.42），職責也不同
+#   （唇擋外側 +Z、槽擋 −Y 與內側 +Z），唇上的兩顆 detent 因此不必搬家。
+TOP_REAR_LIP = TOP_LIP  # 1.30 後舌咬合量（與側舌同一個牆厚上限）
+# 頂鉤前端兩顆 detent 只在頂蓋最後約 6 mm 行程越過，避免整段滑槽磨耗。
+TOP_DETENT_R = 0.70
+TOP_DETENT_DEPTH = 0.45
+TOP_DETENT_X = (-150.0, -20.0)
 # 碟架側舌槽。★ 第九輪改由**碟架自己的頂**導出，不再由 PCIe 卡導出：
 #   卡長現在被碟架的後緣切在 189.00（見檔尾 PCIE_CARD_LEN），卡根本不伸到碟架的
 #   y 帶（180.34 起）裡，「舌要讓開卡」已經是**不成立的理由**——留著它就是硬規則 15
@@ -500,6 +494,24 @@ RACK_RAIL_T = 1.2  # 舌伸入側板的深度
 RACK_RAIL_H = 6.0  # 舌高（Z）
 RACK_RAIL_Z1 = HDD_TOP_Z - 2.0  # 171.82 舌頂＝碟架頂板下方 2 mm
 RACK_RAIL_Z0 = RACK_RAIL_Z1 - RACK_RAIL_H  # 165.82
+# ★ 第十三輪：**承托肩**（使用者：側板對應的溝槽太淺，能不能往內伸一塊擋板托住碟架）。
+#   第十二輪整個碟架 + 4 顆碟（≈2.8 kg）吊在 4 條橫樑末端伸進側槽的
+#   `RACK_RAIL_T − SLIDE_FIT = 0.90` mm 上，承載面積 4 × 12 × 0.90 = **43 mm²**，
+#   而且是剪力落在 2.4 mm 牆挖完槽只剩 1.2 的槽背料上。牆厚 2.4 放不下更深的槽
+#   （`GROOVE_BACK_MIN` 卡死上限），所以承重不能再靠咬合 —— 改成橫樑**坐在**
+#   牆內面長出來的實心肩上，槽退化成純粹的 +Z 約束。
+#   合法性：肩在 z ≈ 157–166，遠高於 Area A 頂（86.52）與 Area C 頂（48.42）；
+#   y ≥ RACK_STOP_Y(182.04) 讓開電源（y ≤ ATX_Y1 149.34）與 PCIe 卡（y ≤ 178+）。
+#   列印性：下表面做 45° 斜撐，Chassis 地板貼床時自撐，不多一根支撐。
+#   間隙：肩頂比橫樑底低 SLIDE_FIT —— 滑入時不磨，載重後落 0.30 就坐實
+#   （硬規則 19：配合面要嘛量出間隙、要嘛把間隙寫進導出式）。
+RACK_LEDGE_D = 8.0  # 肩自牆內面往內伸出（承重寬度）
+RACK_LEDGE_T = 4.0  # 肩的矩形段厚（斜撐另計）
+RACK_LEDGE_Z1 = RACK_RAIL_Z0 - SLIDE_FIT  # 165.52 肩頂面
+RACK_LEDGE_Z0 = RACK_LEDGE_Z1 - RACK_LEDGE_T  # 161.52 矩形段底
+# 斜撐要真的是 45°，量的是「自**埋入牆內的根部**算起」的水平距（硬規則 1：
+# 外伸特徵的根部必須反向埋進母體，只有面接觸 fuse() 不會合併）。
+RACK_LEDGE_GUSSET = RACK_LEDGE_D + CHASSIS_OVERLAP  # 9.0 ⇒ 斜撐底 152.52
 
 # 頂蓋：**嵌入式**（牆長到 OUTER_TOP_Z，蓋子落進牆圍成的口，頂面與牆頂齊平）。
 # ★ 第十輪：`TOP_LEDGE_T / TOP_LEDGE_W`（第七輪的頂蓋承托肩）整組刪掉。
@@ -511,7 +523,7 @@ RACK_RAIL_Z0 = RACK_RAIL_Z1 - RACK_RAIL_H  # 165.82
 #   實測不讓位的話電源掃上去撞鉤唇 450 mm³ —— 這種「最終位置合法、路被擋住」
 #   正是硬規則 14 說的那一類，只有掃描抓得到。
 PSU_SLIDE_X = 0.0
-PSU_SLIDE_Y = TOP_HOOK_D + 1.0  # 7.0
+PSU_SLIDE_Y = TOP_HOOK_D + 1.0  # 4.0（第十四輪鉤唇 6.0 → 3.0 後跟著縮）
 # ★ 第八輪頂蓋改**單片、自 +Y 水平滑入**（第七輪的兩片半搭接是碟艙分段的產物，
 #   碟艙不再是獨立外殼段之後，接縫也沒有理由存在了）。
 
@@ -666,21 +678,54 @@ def psu_slide_room():
     return (CASE_RIGHT - WALL) - ATX_X1
 
 
-def pcie_hook_x():
+def top_rear_tab_bands():
     """
-    兩顆蘑菇柱的中心 X。柱在 z = PCIE_HOOK_Z0（開孔頂之上）→ 那個高度後牆全寬實心，
-    所以柱可以擺在任何 x；擺在壓條兩端，力臂最長。
+    頂蓋後舌（與後牆對應槽）的 X 段。
+
+    後舌與側舌同 z 帶（INNER_TOP_Z−TOP_T … INNER_TOP_Z），而那個高度上機殼內
+    有兩個東西佔著：電源頂 ATX_Z1（x ATX_X0…ATX_X1）與碟架頂板 RACK_TOP_Z1
+    （x RACK_X0…RACK_POST_X1）。舌是**整條路徑掃過去**的，不是只出現在最終位置
+    —— 讓不開就會在滑入途中刮過它們（硬規則 14／22：最終位置合法不等於路走得通）。
+    左段因此被電源壓成側舌那麼窄，右段（電源右緣以外、碟架右立板以外）才是主力。
     """
-    cs = pcie_centers()
-    h = PCIE_HOOK_HEAD_W / 2
-    return (min(cs) - PCIE_OPEN_W / 2 - h - 1.0, CASE_RIGHT - h - 0.5)
+    return (
+        (FLOOR_X0 - TOP_LIP, ATX_X0 - PSU_FIT_GAP),
+        (RACK_POST_X1 + SLIDE_FIT, FLOOR_X1 + TOP_LIP),
+    )
+
+
+def pcie_rib_x():
+    """三根槽間肋的中心 X（相鄰兩槽中心的中點）。"""
+    cs = sorted(pcie_centers())
+    return [(cs[i] + cs[i + 1]) / 2 for i in range(len(cs) - 1)]
+
+
+def pcie_lock_x():
+    """
+    壓條兩顆螺絲的鎖點 X ＝ **最外兩根肋的正上方**。
+    ★ 第十三輪：舊做法把鎖座擺在四個開孔的左右兩側，右側只剩
+      `CASE_RIGHT − 最右開孔緣 = 3.61`，塞不下通孔加壁料；而且鎖座是獨立
+      長出來的懸臂，跟窗框是兩塊分開的料。鎖在肋的正上方之後，螺絲的拉力
+      直接落在肋的上端固定端上，與繫樑同一塊料（硬規則 20：要問另一端接到哪裡）。
+    """
+    ribs = pcie_rib_x()
+    return (ribs[0], ribs[-1])
 
 
 def pcie_bar_x():
-    """壓條本體 X 範圍（在機殼**外面**）：涵蓋四個壓舌與兩顆蘑菇柱。"""
-    lo, hi = pcie_hook_x()
-    h = PCIE_HOOK_HEAD_W / 2
-    return (lo - h - 2.0, min(CASE_RIGHT, hi + h + 2.0))
+    """外置壓條 X 範圍：涵蓋四個開孔（含尖頂）與兩個耳。"""
+    cs = pcie_centers()
+    return (min(cs) - PCIE_OPEN_W / 2 - 1.0, max(cs) + PCIE_OPEN_W / 2 + 1.0)
+
+
+def pcie_bar_mount_y():
+    """壓條的安裝面（貼著窗框補強外表面的那一面）＝盲牙的開口面。"""
+    return CASE_REAR - PCIE_RIB_D
+
+
+def pcie_lock_socket_end():
+    """盲牙盲端的 Y；後牆內面必須還有料（盲孔不能打穿到內腔）。"""
+    return pcie_bar_mount_y() + MB_SOCKET_DEPTH
 
 
 def project_paths():
@@ -697,21 +742,19 @@ def project_paths():
 def envelope_mm():
     """
     整機外包絡 (W, D, H)。單一長方體：無階梯、無外凸腳、無下裙。
-    ★ 深度**不含**後牆外側的 PCIe 壓條（它掛在後牆外 4 mm）——那是外掛件，
-      但機殼靠牆擺時它會頂到牆，所以 verify 另有一條檢查把它算進「安裝深度」。
+    深度不含後牆外側的 PCIe 窗框補強、PCIeBar 與兩顆 #6-32 螺絲頭；
+    `rear_outer_protrusion()` 另算完整裝機靠牆所需的後凸。
     """
     return (CASE_W, CASE_D, OUTER_TOP_Z + SKIRT_H)
 
 
 def rear_outer_protrusion():
     """
-    後牆外表面往 −Y 最凸的量。★ 第十輪修正：舊版 `install_depth_mm` 直接回傳
-    `CASE_D + PCIE_BAR_T`，而最凸的其實是 **keyhole 蘑菇柱 8.00**（頸 5.5 + 頭 2.5），
-    壓條只有 5.0 —— 少報 3 mm。更糟的是那條 verify 拿
-    `install_depth_mm() <= CASE_D + PCIE_BAR_T` 去比，**它在跟自己的定義比**，
-    永遠是綠的（vacuous check，硬規則 16）。
+    完整裝機時後牆外表面往 −Y 最凸的量（窗框補強 + 鎖點凸台 + 壓條）。
+    ★ 第十三輪螺絲軸由 Y 改 Z，螺絲頭朝上不再吃 Y ⇒ 最凸的就是壓條外表面。
+      這是導出值，不是量測值；verify 另從幾何量 `obb().YMin` 對照（硬規則 16）。
     """
-    return max(PCIE_BAR_T, PCIE_HOOK_NECK_D + PCIE_HOOK_HEAD_D, PCIE_RIB_D)
+    return CASE_REAR - (pcie_bar_mount_y() - PCIE_BAR_T)
 
 
 def install_depth_mm():
@@ -730,42 +773,32 @@ def io_edge_material():
     return IO_X0 - CASE_LEFT
 
 
-# 列印檔名（第八輪：11 個列印件）
-# ★ 分件的理由是 **A1 床 256**：CASE_D = 301.00 > 256，底板／側板／頂蓋不可能一件到底。
-#   所以機殼仍分「主板段（247.24 深，印得下）」與「前罩（53.76 深）」，
-#   碟架**橫跨**兩段（y 180.34→283.94）並把兩段繫在一起——它取代了第七輪的搭接片。
+# 列印件 manifest（第十二輪：8 種 STL）
 STL_NAMES = {
-    "Bottom_Tray": "底板_主板托盤.stl",
-    "Rear_IO_PCIe": "後牆_IO與PCIe.stl",
-    "Side_Left_MB": "左側板_主板段.stl",
-    "Side_Right_MB": "右側板_主板段.stl",
+    "Chassis_Body": "機殼本體_主板段一體式.stl",
     "Top_MB": "頂蓋_主板段.stl",
     "Front_Shroud": "前罩_含進氣柵.stl",
     "HDD_Rack": "碟架_四層導軌.stl",
-    "HDD_Tray": "碟托盤.stl",  # ×4
+    "HDD_Tray": "碟托盤.stl",
     "PCIeBlank": "PCIe槽蓋.stl",
     "PCIeBar": "PCIe壓條_外置.stl",
-    "MB_Nut": "主板壓帽.stl",
+    "MB_Screw": "主板螺絲_印製.stl",
 }
-STRUCT_PART_KEYS = tuple(STL_NAMES)
-TRAY_COUNT = HDD_COUNT  # 碟托盤 ×4（同一個 STL 印四份）
+# 六向保持力表只展開真正可拆的外殼件；Chassis 是基準，PCIeBar／螺絲另做專用檢查。
+STRUCT_PART_KEYS = ("Top_MB", "Front_Shroud", "HDD_Rack", "HDD_Tray")
+TRAY_COUNT = HDD_COUNT
 
-# 每個 STL 要印幾份。**買料要用這個，不是「一件一份」的和。**
-# 第十一輪之前 `PRINT_VOLUME` 是逐件加總、沒有乘份數，於是文件寫的
-# 「印料 1032 cm³」少算了碟托盤 ×3 與壓帽 ×8，實際是 1240 cm³（差 20%）。
-# 份數一律由既有常數導出，不寫魔術數字（硬規則 15）。
 PART_QTY = {
-    "Bottom_Tray": 1,
-    "Rear_IO_PCIe": 1,
-    "Side_Left_MB": 1,
-    "Side_Right_MB": 1,
+    "Chassis_Body": 1,
     "Top_MB": 1,
     "Front_Shroud": 1,
     "HDD_Rack": 1,
     "HDD_Tray": TRAY_COUNT,
-    "PCIeBlank": PCIE_COUNT,  # 最壞情況：四槽全空
+    "PCIeBlank": PCIE_COUNT,
     "PCIeBar": 1,
-    "MB_Nut": MB_NUT_COUNT,
+    # ★ 第十三輪：`MB_Screw` 不再只服務主板。壓條的兩顆鎖點改成同規格的印製盲內牙，
+    #   螺絲是同一顆 → 份數是 9 + 2。只寫 MB_SCREW_COUNT 就是硬規則 26 的漏乘。
+    "MB_Screw": MB_SCREW_COUNT + PCIE_BAR_SCREW_COUNT,
 }
 if set(PART_QTY) != set(STL_NAMES):  # 漏件守衛（硬規則 7）
     raise SystemExit(
@@ -773,6 +806,11 @@ if set(PART_QTY) != set(STL_NAMES):  # 漏件守衛（硬規則 7）
     )
 # 已移除（不得再出現）
 REMOVED_SHELL_PARTS = (
+    "Bottom_Tray",
+    "Rear_IO_PCIe",
+    "Side_Left_MB",
+    "Side_Right_MB",
+    "MB_Nut",
     "Side_Left_HDD",
     "Side_Right_HDD",
     "Front_Panel",
@@ -783,6 +821,11 @@ REMOVED_SHELL_PARTS = (
     "HDD_Cage",  # 第八輪：直立碟艙外殼 → 平躺碟架
 )
 REMOVED_STL = (
+    "底板_主板托盤.stl",
+    "後牆_IO與PCIe.stl",
+    "左側板_主板段.stl",
+    "右側板_主板段.stl",
+    "主板壓帽.stl",
     "左側板_碟艙段.stl",
     "右側板_碟艙段.stl",
     "前板.stl",
@@ -818,8 +861,25 @@ RACK_POST_X1 = RACK_POST_X0 + RACK_WALL  # 5.35
 HDD_TRAY_X0 = HDD_X0
 HDD_TRAY_X1 = RACK_POST_X0
 # 右側兩條橫樑：把碟架繫到右側板（右立板離右內牆 29.44）。分兩條讓線從中間穿過。
-RACK_BEAM_W = 12.0  # 沿 Y
-RACK_BEAM_Y = (HDD_Y0 + 6.0, BAY_SPLIT_Y - 8.0)  # 都落在側板槽的 y 帶內
+RACK_BEAM_W = 12.0  # 側舌橫樑沿 Y
+# ★ 第十三輪加第三根。前兩根都在 Chassis 的 y 範圍內（≤ BAY_SPLIT_Y 234.18），
+#   而碟架一路到 283.94 —— **前段 49.76 mm 是純懸臂**，Chassis 構不到，
+#   第十二輪那裡什麼都沒有。第三根落在前罩的承托肩上（前罩 y ≥ 234.18），
+#   前段懸臂降到 HDD_Y1 − 281.94 ≈ 2 mm。它在 Chassis 範圍外，**沒有側舌**
+#   （那裡沒有牆槽），純粹是坐在肩上的承重樑。
+RACK_BEAM_Y = (HDD_Y0 + 6.0, BAY_SPLIT_Y - 8.0, HDD_Y1 - RACK_BEAM_W / 2 - 2.0)
+# 有側舌的橫樑（只有落在 Chassis 側牆槽 y 範圍內的那幾根）
+RACK_RAIL_BEAM_Y = tuple(by for by in RACK_BEAM_Y if by + RACK_BEAM_W / 2 <= BAY_SPLIT_Y)
+# 最底層托盤下方的承托格柵：三條 X 橫樑由中央 Y 縱樑連成一體。
+RACK_BASE_BEAM_W = 12.0
+RACK_BASE_BEAM_Y = (
+    TRAY_Y0 + RACK_BASE_BEAM_W / 2,
+    (TRAY_Y0 + HDD_Y1) / 2,
+    HDD_Y1 - RACK_BASE_BEAM_W / 2,
+)
+RACK_BASE_SPINE_W = 12.0
+RACK_BASE_SPINE_X = (RACK_X0 + RACK_POST_X1) / 2
+RACK_BASE_Z1 = HDD_Z0 - SLIDE_FIT  # lv0 托盤底保留 0.30 mm 滑配
 # ★ 第十一輪：側板碟架槽的**盲端**（＝碟架往 −Y 推到底的止擋面）。
 #   第十輪量出來：碟架往 −Y 還能再走 3.00 mm 才撞到側板 —— 槽的後端開到
 #   TRAY_Y0 − 1.0 = 179.34，比最後那條側舌的後緣（182.34）還後面 3 mm。
@@ -829,7 +889,8 @@ RACK_BEAM_Y = (HDD_Y0 + 6.0, BAY_SPLIT_Y - 8.0)  # 都落在側板槽的 y 帶�
 RACK_STOP_Y = min(RACK_BEAM_Y) - RACK_BEAM_W / 2 - SLIDE_FIT  # 182.04
 SHROUD_Y0 = BAY_SPLIT_Y
 SHROUD_D = CASE_FRONT - SHROUD_Y0  # 53.76
-SHROUD_LAP = 12.0  # 前罩往後搭在主板段外表面上的長度（滑合帶）
+SHROUD_LAP = 14.0  # 加長搭接，提高導向與側向保持
+SHROUD_LEAD_IN = 1.0  # 四個先進入端的 45° 導入
 SHROUD_LAP_T = 1.2  # 前罩搭接殼厚（側板外表面對應減薄 SHROUD_LAP_T + SLIDE_FIT）
 # ★ 第九輪：前罩不再只是「套著」。第八輪搭接帶 nominal 零間隙、沒有舌、沒有槽、
 #   沒有 detent —— 使用者問「你確定前蓋是用卡槽蓋卡住的嗎」，答案是不確定，它不是。
@@ -850,52 +911,46 @@ SHROUD_DETENT_Z = (55.0, 100.0, 145.0)  # ★ 第十輪 2 → 3 顆／側
 SHROUD_LAP_DETENT_R = 0.70
 SHROUD_LAP_DETENT_DEPTH = 0.45
 SHROUD_LAP_DETENT_X = (-150.0, -20.0)  # 避開主板柱讓位槽（L/M 兩孔）與底板兩側舌
+# --- 第十三輪：前罩搭接帶改 U 形雙壁夾持 ---
+# 使用者：「前罩插上去的地方，能不能改成有縫隙可以插進去、兩邊夾住的方式，
+# 而不是單純靠單邊凸點卡槽卡住？」第十二輪搭接帶只有**外壁**一片（SHROUD_LAP_T）
+# 貼在側牆的外面減薄帶上，牆的內面整片是光的 —— 前罩對牆只有一個方向有料，
+# 側向保持全靠 detent 的摩擦。補一片內壁之後，Chassis 的牆被整片夾在中間。
+SHROUD_INNER_T = 1.6  # 內壁厚（前罩不承重；與 SHROUD_WALL 同級）
+# 內壁只能長在牆內面**沒有滑槽**的 z 帶（build_case.side_lap_thin_bands()），
+# 下限再讓開 Area B 淨空（右牆內面到主板右緣只有 0.50，內壁是長在板上方的料），
+# 上限再讓開碟架承托肩的 45° 斜撐底。左側 x 在板緣外本無此限，取同值保持對稱。
+SHROUD_INNER_Z0 = AREA_B_TOP_Z + SLIDE_FIT  # 25.86
+SHROUD_INNER_Z1 = RACK_LEDGE_Z0 - RACK_LEDGE_GUSSET - SLIDE_FIT  # 152.22
+# 內壁貼的是 **Chassis 牆的內面**，而前罩主體壁的內面比它外 SHROUD_WALL − WALL − ...
+# 差 1.10 mm ⇒ 進了主體段要有一塊料把兩者接起來，否則內壁是自由飄浮的板。
+SHROUD_INNER_JOIN = 4.0
+# --- 碟架承托肩的 Y 範圍（Chassis 段與前罩段接力）---
+RACK_LEDGE_Y0 = RACK_STOP_Y  # 182.04 自碟架推到底的止擋面起
+RACK_LEDGE_Y1 = SHROUD_Y0 - SHROUD_LAP  # 220.18 到前罩搭接帶起點（讓開內壁）
+SHROUD_LEDGE_D = RACK_LEDGE_D  # 前罩段的肩與 Chassis 段同寬（硬規則 9：同一界線同一來源）
+SHROUD_LEDGE_Y0 = SHROUD_Y0 + SLIDE_FIT  # 234.48 讓開 Chassis 牆的前端面
+SHROUD_LEDGE_Y1 = CASE_FRONT - TRAY_FACE_T  # 284.94 到前面板內面
+# 前罩列印姿態是 Y−（前面板朝上、搭接帶貼床），y 就是列印高度方向 ⇒ 肩在 ly0
+# 那一層不能憑空出現整個斷面。貼床端做 45° 楔形引入（高＝肩厚），維持無支撐。
+SHROUD_LEDGE_LEAD = RACK_LEDGE_T  # 4.0 ⇒ 45°
 # 應支援的 PCIe 卡長：由**碟架後緣**切出來（碟架 y ≥ 180.34 整段都是實體）。
 # ★ 這是**刻意的取捨**：第八輪寫 230，那時碟陣在機殼左半、卡的右半沒人擋。
 #   第九輪把碟架置中之後，卡的 x 帶與碟架重疊 → 只能二選一。使用者說過
-#   「頂多只會插一些網路口的擴充卡」，所以選了碟架。189.00 仍 > CEM 半長卡 167.65。
-PCIE_CARD_LEN = TRAY_Y0 - (CASE_REAR + WALL) - 2.0  # 189.00
+#   「頂多只會插一些網路口的擴充卡」，所以選了碟架。190.61 仍 > CEM 半長卡 167.65。
+PCIE_CARD_LEN = TRAY_Y0 - (CASE_REAR + WALL) - 2.0  # 190.61
 
 # ============================================================================
-# 組裝順序（第十輪，使用者指定）—— **唯一來源**
-# ============================================================================
-# (件名, 沿 Y 的裝入位移)。0 = 基準件（放著不動）；負 = 自 +Y 往 −Y 滑進去；
-# 正 = 自 −Y 往 +Y 推進去。verify 依這張表**逐步**掃描：第 i 件掃的時候，
-# 場上只有第 0..i−1 件 —— 這樣才真的是在驗「照這個順序裝得起來」，
-# 而不是「每一件在最後那個場景裡動得了」。
-# ★ 第八／九輪的掃描是後者：每一條都拿**完整總成**當障礙物，
-#   於是「後牆要先裝還是後裝」這件事從來沒有被驗過。
+# 組裝順序（第十二輪）—— **唯一來源**
+# (件名, 沿 Y 的裝入位移)。0 = 一體式 Chassis 基準；負 = 自 +Y 往 −Y 滑入。
+# verify 依這張表逐步掃描：第 i 件移動時，場上只有第 0..i−1 件。
 ASSEMBLY_STEPS = (
-    ("Bottom_Tray", 0.0),
-    ("Side_Left_MB", -(BAY_SPLIT_Y - FLOOR_Y0 + 20.0)),
-    ("Side_Right_MB", -(BAY_SPLIT_Y - FLOOR_Y0 + 20.0)),
-    ("Rear_IO_PCIe", REAR_TAB_D + 6.0),
+    ("Chassis_Body", 0.0),
     ("HDD_Rack", -(CASE_FRONT - TRAY_Y0)),
     ("Top_MB", -(CASE_FRONT - FLOOR_Y0)),
     ("Front_Shroud", -(SHROUD_LAP + SHROUD_D + 20.0)),
     ("HDD_Tray", -(HDD_W + TRAY_FRONT_GAP + 10.0)),
 )
-
-
-def floor_detent_sites(is_left):
-    """
-    底板側緣 bead（軸沿 Z）的 (中心 x, 中心 y)。**唯一來源**：底板 fuse 它、
-    側板 cut 對應凹槽、verify 量它。bead 外表面凸出底板側緣 FLOOR_DETENT_DEPTH，
-    其中 SLIDE_FIT 是本來就有的間隙，剩下的才是過盈。
-    """
-    if is_left:
-        cx = (FLOOR_X0 + SLIDE_FIT) - FLOOR_DETENT_DEPTH + FLOOR_DETENT_R
-    else:
-        cx = (FLOOR_X1 - SLIDE_FIT) + FLOOR_DETENT_DEPTH - FLOOR_DETENT_R
-    return [
-        (cx, FLOOR_Y0 + FLOOR_DETENT_RUN + i * FLOOR_DETENT_PITCH)
-        for i in range(FLOOR_DETENT_N)
-    ]
-
-
-def floor_detent_run_mm():
-    """bead 的過盈行程長度（側板槽自它的後端掃過來，只有最後這一段有過盈）。"""
-    return FLOOR_DETENT_RUN + (FLOOR_DETENT_N - 1) * FLOOR_DETENT_PITCH
 
 
 def pcie_frame_x():
@@ -912,8 +967,14 @@ def pcie_frame_x():
 
 
 def pcie_frame_z():
-    """窗框補強在 Z 上的範圍：自開孔底下方 PCIE_FRAME_M 到壓條下緣（讓開壓條本體）。"""
-    return (PCIE_Z0 - PCIE_FRAME_M, PCIE_BAR_Z0 - SLIDE_FIT)
+    """
+    窗框補強在 Z 上的範圍：自開孔底下方 PCIE_FRAME_M 到**繫樑頂**。
+    ★ 第十三輪上限由「壓條下緣」改成 `PCIE_TIE_Z1`。壓條在補強層的**外面**
+      （y ∈ [CASE_REAR − PCIE_RIB_D − PCIE_BAR_T, CASE_REAR − PCIE_RIB_D]），
+      兩者 y 不重疊，本來就不必為它讓開；而繫樑頂面現在是壓條的鎖點所在面，
+      補強層不長到那裡的話，那兩個盲內牙就鑽在只有 2.4 厚的牆上。
+    """
+    return (PCIE_Z0 - PCIE_FRAME_M, PCIE_TIE_Z1)
 
 
 FCSTD_NAME = "機殼總成.FCStd"

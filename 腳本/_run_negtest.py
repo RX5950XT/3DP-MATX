@@ -1,9 +1,9 @@
-"""FreeCADCmd 進入點：負向測試。離開碼 0 = 每條檢查都示範得出它抓得到舊病灶。
+r"""FreeCADCmd 進入點：第十二輪負向測試。
 
-`verify` 全綠只證明「我檢查的都對」。這支把修掉的缺陷重新塞回幾何裡，
-確認對應的檢查真的會紅——否則那條檢查可能只是跟著參數一起錯（vacuous check）。
+每一組都同時建立「復活的病灶」與現況對照；離開碼 0 只代表所有檢查確實能
+區分兩者，不代表實機性能已驗證。
 
-    FreeCADCmd -c <root>\\scripts\\_run_negtest.py
+    FreeCADCmd -c <root>\scripts\_run_negtest.py
 """
 
 import io
@@ -32,544 +32,601 @@ def main():
     D = load_params()
     box = V.mk_box
     doc = App.openDocument(os.path.join(V.PATHS["cad"], D.FCSTD_NAME))
-    S = {o.Name: o.Shape for o in doc.Objects}
+    shapes = {obj.Name: obj.Shape for obj in doc.Objects}
     mocks = V.hardware_mocks()
-    MAX = V.INTERFERE_MAX
-    res = []
+    limit = V.INTERFERE_MAX
+    results = []
 
-    def add(name, cond, note):
-        res.append((name, cond, note))
+    def add(name, condition, note):
+        results.append((name, bool(condition), note))
 
-    tray, rear, rack = S["Bottom_Tray"], S["Rear_IO_PCIe"], S["HDD_Rack"]
-    side_l, side_r, top = S["Side_Left_MB"], S["Side_Right_MB"], S["Top_MB"]
-    bar, dtray = S["PCIeBar"], S["HDD_Tray"]
+    def inside(shape, point):
+        return V.pt_inside(shape, *point, 0.02)
 
-    # ══ 仍然有效的舊病灶（第七輪之前）═══════════════════════════════
-    # 1. 舊九孔座標 → 用舊座標鑽孔的主板會被新柱子戳穿
-    OLD_HOLES = {
+    def sweep(shape, dx=0.0, dy=0.0, dz=0.0, steps=12):
+        swept = shape
+        for i in range(1, steps + 1):
+            moved = shape.copy()
+            moved.translate(App.Vector(dx * i / steps, dy * i / steps, dz * i / steps))
+            swept = swept.fuse(moved)
+        return swept
+
+    chassis = shapes["Chassis_Body"]
+    top = shapes["Top_MB"]
+    shroud = shapes["Front_Shroud"]
+    rack = shapes["HDD_Rack"]
+    tray = shapes["HDD_Tray"]
+    bar = shapes["PCIeBar"]
+
+    # ── 規格 literal／舊佈局 ────────────────────────────────────────
+    old_holes = {
         "B": (0.00, 0.00), "C": (-45.72, 0.00), "F": (-203.20, 0.00),
         "R": (20.32, 132.08), "S": (0.00, 132.08), "H": (-45.72, 132.08),
         "J": (-203.20, 132.08), "L": (-45.72, 204.47), "M": (-203.20, 204.47),
     }
-    pcb_old = box(D.BOARD_LEFT, -22.86, D.BOARD_TOP_Z - D.PCB_T, D.BOARD_RIGHT, 220.98,
-                  D.BOARD_TOP_Z)
-    r = D.PCB_HOLE_D / 2
-    for hx, hy in OLD_HOLES.values():
-        pcb_old = pcb_old.cut(
-            box(hx - r, hy - r, D.BOARD_TOP_Z - D.PCB_T - 1, hx + r, hy + r, D.BOARD_TOP_Z + 1)
-        )
-    add("舊九孔座標 → 主板被柱子戳穿", V.common_vol(pcb_old, tray) > MAX,
-        f"{V.common_vol(pcb_old, tray):.0f} mm3")
-    add("現況 → 九根柱全部穿過孔", V.common_vol(mocks["主板PCB"], tray) <= MAX,
-        f"{V.common_vol(mocks['主板PCB'], tray):.2f} mm3")
-
-    # 2. 電源放回板下 → 直接吃掉主板
-    psu_low = box(D.ATX_X0, D.ATX_Y0, D.FLOOR_T, D.ATX_X1, D.ATX_Y1, D.FLOOR_T + D.ATX_H)
-    add("電源放回板下 → 直接吃掉主板", V.common_vol(psu_low, mocks["主板PCB"]) > MAX,
-        f"{V.common_vol(psu_low, mocks['主板PCB']):.0f} mm3")
-
-    # 3. 螺紋是真螺旋（相位轉 180° 必撞；軸對稱的假牙怎麼轉都不會撞）
-    nut = B.make_mb_nut()
-    hx, hy = D.HOLES_MM["B"]
-    r0 = V.common_vol(B.place_mb_nut(nut, hx, hy, D.BOARD_TOP_Z), tray)
-    nr = B.place_mb_nut(nut, hx, hy, D.BOARD_TOP_Z)
-    nr.rotate(App.Vector(hx, hy, 0), App.Vector(0, 0, 1), 180.0)
-    r180 = V.common_vol(nr, tray)
-    add("現況 → 真螺旋", r0 <= MAX < r180, f"轉 0°/180° 干涉 {r0:.2f}/{r180:.2f}")
-
-    # ══ 第八輪新增的病灶 ═══════════════════════════════════════════
-    # 4. 下裙回來 → 「z<0 不准有料」要紅
-    skirt = box(D.CASE_LEFT, D.CASE_REAR, -10.0, D.CASE_RIGHT, D.CASE_FRONT, 0.0)
-    add("舊下裙塞回 → 「z<0 無料」應紅", skirt.BoundBox.ZMin < -0.05,
-        f"裙底 {skirt.BoundBox.ZMin:.1f}")
-    lo = min(V.obb(s).ZMin for k, s in S.items() if k != "PCIeBlank")
-    add("現況 → 沒有任何料在 z<0", lo >= -0.05, f"最低 {lo:.2f}")
-
-    # 5. 直立碟艙回來 → 碟頂高過**電源決定的內頂**（＝電源下移後真正的基準線），
-    #    而且還要多吃 45 mm 深度。基準必須是電源那條，不是現況的 INNER_TOP_Z ——
-    #    現況的內頂本來就是碟撐出來的，拿它當基準這條檢查會自己把自己抵銷掉。
-    # ★ 第十輪再鎖一次基準：電源升到內頂之後，直立碟艙**不再是高度瓶頸**
-    #   （直立碟頂 171.4 < 內頂 176.82），舊的比法會自己變綠 —— 那就是 vacuous。
-    #   現在改比**深度**：兩種佈局各自在主板段之外多吃多少 mm。
-    UPRIGHT_BAY_D = 65.10  # 第七輪直立 2×2 碟艙的深度（tasks/todo.md 第八輪的佈局掃描）
-    flat_bay_d = D.CASE_FRONT - D.BAY_SPLIT_Y
-    add("舊直立 2×2 塞回 → 主板段之外多吃的深度變大", UPRIGHT_BAY_D > flat_bay_d,
-        f"直立 {UPRIGHT_BAY_D:.2f} > 平躺 {flat_bay_d:.2f}（差 {UPRIGHT_BAY_D - flat_bay_d:.2f}）")
-    add("現況 → 平躺碟頂在內頂之下", D.HDD_TOP_Z <= D.INNER_TOP_Z,
-        f"{D.HDD_TOP_Z:.1f} <= {D.INNER_TOP_Z:.1f}")
-
-    # 6. 內置壓條回來 → 「壓條不得伸進機殼內」要紅
-    y_in = D.CASE_REAR + D.WALL
-    bar_old = box(-50.0, y_in, D.PCIE_BAR_Z0, D.CASE_RIGHT - D.WALL, y_in + 9.0, D.PCIE_BAR_Z0 + 4)
-    add("舊內置壓條塞回 → 「不得往內突出」應紅", V.obb(bar_old).YMax > y_in + 0.05,
-        f"YMax {V.obb(bar_old).YMax:.2f} > 後牆內面 {y_in:.2f}")
-    add("現況 → 壓條整條在機殼外", V.obb(bar).YMax <= y_in + 0.05,
-        f"YMax {V.obb(bar).YMax:.2f}")
-
-    # 7. 托盤後擋邊長在碟體裡（TRAY_BACK_STOP=0）→ 干涉要紅
-    stop_bad = box(D.HDD_X0, D.TRAY_Y0, D.HDD_Z0 + D.TRAY_T, D.HDD_X1,
-                   D.TRAY_Y0 + D.TRAY_BACK_STOP, D.HDD_Z0 + D.TRAY_T + D.TRAY_LIP_H)
-    hdd0 = mocks["HDD_L0"]
-    bad = box(D.HDD_X0, D.TRAY_Y0, D.HDD_Z0 + D.TRAY_T, D.HDD_X1, D.TRAY_Y0 + D.HDD_W,
-              D.HDD_Z0 + D.TRAY_T + D.HDD_H)  # 碟不讓開擋邊時的位置
-    add("碟不讓開後擋邊 → 擋邊長在碟體裡", V.common_vol(stop_bad, bad) > MAX,
-        f"{V.common_vol(stop_bad, bad):.0f} mm3")
-    add("現況 → 碟讓開了後擋邊", V.common_vol(stop_bad, hdd0) <= MAX,
-        f"{V.common_vol(stop_bad, hdd0):.2f} mm3")
-
-    # 8. 碟陣往後推過 Fig.7 的 Area A/C 界線 → 侵入散熱器空間
-    #    ★ 第九輪改用**碟托盤**當代表：碟架在那個高度是開放的碟艙（沒有料），
-    #      拿碟架去撞 Area A 只會得到 0 —— 檢查會變成 vacuous。托盤才是那一層的料。
-    key_a = [k for k in mocks if k.startswith("淨空_AreaA")][0]
-    tray_back = B.make_hdd_tray_placed(0)
-    tray_back.translate(App.Vector(0, -20.0, 0))
-    add("碟托盤往後 20 mm → 侵入 Area A 淨空", V.common_vol(tray_back, mocks[key_a]) > MAX,
-        f"{V.common_vol(tray_back, mocks[key_a]):.0f} mm3")
-    add("現況 → 碟架與托盤都不碰 Area A",
-        max(V.common_vol(rack, mocks[key_a]),
-            max(V.common_vol(B.make_hdd_tray_placed(lv), mocks[key_a])
-                for lv in range(D.HDD_LEVELS))) <= MAX,
-        f"{V.common_vol(B.make_hdd_tray_placed(0), mocks[key_a]):.2f} mm3")
-
-    # 9. 卡長放回第八輪的 230 → 卡直接插進碟架（碟架置中後兩者 X 帶重疊）
-    y_in0 = D.CASE_REAR + D.WALL
-    v = 0.0
-    for cx in D.pcie_centers():
-        card230 = box(cx - D.PCIE_CARD_HALF_W, y_in0, D.PCIE_CARD_Z0,
-                      cx + D.PCIE_CARD_HALF_W, y_in0 + 230.0, D.PCIE_CARD_Z1)
-        v = max(v, V.common_vol(card230, rack))
-    add("卡長放回 230 → 卡插進碟架", v > MAX, f"{v:.0f} mm3")
-    vn = max(V.common_vol(rack, mocks[f"PCIe{i}_card"]) for i in range(D.PCIE_COUNT))
-    add("現況 → 189.00 的卡讓開碟架", vn <= MAX, f"{vn:.2f} mm3")
-
-    # 10. 頂蓋側舌往上埋進槽頂 → 撞側板（本輪實測 8.64 mm³／側）
-    lip_bad = box(D.FLOOR_X0 - D.TOP_LIP, D.FLOOR_Y0, D.INNER_TOP_Z,
-                  D.FLOOR_X0, D.BAY_SPLIT_Y, D.INNER_TOP_Z + 1.0)
-    add("頂蓋側舌往上埋 → 撞側板牆料", V.common_vol(lip_bad, side_l) > MAX,
-        f"{V.common_vol(lip_bad, side_l):.1f} mm3")
-    add("現況 → 頂蓋不撞側板", V.common_vol(top, side_l) <= MAX,
-        f"{V.common_vol(top, side_l):.2f} mm3")
-
-    # 11. 後牆定位舌往機殼內 → 右邊那片直接戳進主板與 Area B 淨空
-    tab_bad = box(D.CASE_RIGHT - D.WALL - D.REAR_TAB_T, y_in - 0.5, D.FLOOR_T,
-                  D.CASE_RIGHT - D.WALL, y_in + D.REAR_TAB_D, 150.0)
-    v = V.common_vol(tab_bad, mocks["主板PCB"]) + V.common_vol(tab_bad, mocks["淨空_AreaB_15.24"])
-    add("定位舌往機殼內 → 戳進主板／Area B", v > MAX, f"{v:.0f} mm3")
-    add("現況 → 定位舌長在牆體側", V.common_vol(rear, mocks["主板PCB"]) <= MAX,
-        f"{V.common_vol(rear, mocks['主板PCB']):.2f} mm3")
-
-    # 12. detent 半徑放回 1.2 → 球從機殼**外表面**戳出來（單一長方體破功）
-    #    ★ 第十輪重新定錨：detent 公母對調之後球長在側板槽底、往機殼內凸，
-    #      舊的「戳進電源本體」已經不成立（電源也往右讓開了）——那條會永遠綠。
-    #      現在管住它的是另一邊：球心埋在槽底後方，半徑一大就從側板外表面凸出來。
-    env_lb = box(D.CASE_LEFT, D.CASE_REAR, -1.0, D.CASE_RIGHT, D.CASE_FRONT, D.OUTER_TOP_Z)
-    cx_bad = D.CASE_LEFT + D.WALL - (D.REAR_TAB_T + D.SLIDE_FIT + 1.2 - D.DETENT_DEPTH)
-    ball_bad = Part.makeSphere(1.2)
-    ball_bad.translate(App.Vector(cx_bad, y_in + D.REAR_TAB_D / 2, 100.0))
-    out_v = ball_bad.cut(env_lb).Volume
-    add("detent R=1.2 → 球從側板外表面戳出來", out_v > MAX, f"外溢 {out_v:.2f} mm3")
-    add("現況 → detent 球被裁在外表面之內（側板不外溢）",
-        side_l.cut(env_lb).Volume <= MAX, f"{side_l.cut(env_lb).Volume:.2f} mm3")
-    add("現況 → 2R <= 舌厚 + 凸出", 2 * D.DETENT_R <= D.REAR_TAB_T + D.DETENT_DEPTH + 1e-6,
-        f"2R={2 * D.DETENT_R} <= {D.REAR_TAB_T + D.DETENT_DEPTH}")
-
-    # ══ 第九輪：使用者驗收指出的病灶 ═══════════════════════════════
-    y_wall = D.CASE_REAR + D.WALL / 2
-    cs_sorted = sorted(D.pcie_centers())
-    rib_zs = [D.PCIE_Z0 - 1.0, (D.PCIE_Z0 + D.PCIE_Z1) / 2, D.PCIE_Z1,
-              D.PCIE_Z1 + D.PCIE_LIFT / 2, D.PCIE_Z1 + D.PCIE_LIFT + D.PCIE_TIE_H / 2]
-
-    def rib_broken(shape):
-        for i in range(len(cs_sorted) - 1):
-            xm = (cs_sorted[i] + cs_sorted[i + 1]) / 2
-            if any(not V.pt_inside(shape, xm, y_wall, z, 0.02) for z in rib_zs):
-                return True
-        return False
-
-    # 13. 第八輪的連續橫縫塞回去 → 三根 1.42 的肋變成 112.75 mm 懸臂
-    seam = box(min(cs_sorted) - D.PCIE_OPEN_W / 2, D.CASE_REAR - 0.5, D.PCIE_Z1,
-               D.CASE_RIGHT + 0.5, D.CASE_REAR + D.WALL + 0.5, D.PCIE_Z1 + D.PCIE_LIFT)
-    add("舊連續橫縫塞回 → 肋上端斷掉（懸臂）", rib_broken(rear.cut(seam)), "肋頂端無料")
-    add("現況 → 三根肋上下貫通", not rib_broken(rear), "五個取樣點全有料")
-    add("現況 → 肋外側補強實心",
-        all(V.pt_inside(rear, (cs_sorted[i] + cs_sorted[i + 1]) / 2,
-                        D.CASE_REAR - D.PCIE_RIB_D / 2, (D.PCIE_Z0 + D.PCIE_Z1) / 2, 0.02)
-            for i in range(len(cs_sorted) - 1)),
-        f"斷面 {D.PCIE_PITCH - D.PCIE_OPEN_W:.2f}×{D.WALL + D.PCIE_RIB_D:.2f}")
-
-    # 13b. keyhole：落差必須 >= 頭高，否則寬口與窄段在同一個 Z 上矛盾
-    add("落差 2.0 < 頭高 3.0 → keyhole 幾何矛盾", 2.0 < D.PCIE_HOOK_H, "2.0 < 3.0")
-    add("現況 → 落差 >= 頭高", D.PCIE_BAR_DROP >= D.PCIE_HOOK_H,
-        f"{D.PCIE_BAR_DROP} >= {D.PCIE_HOOK_H}")
-
-    # 17. 碟架沒有承載料（立板底＝lv0 槽底）→ 最底層托盤舌下方是空的
-    zr = D.tray_z0(0) - D.SLIDE_FIT - 1.0
-    xs_probe = [D.HDD_TRAY_X0 - D.TRAY_RAIL_W / 2, D.HDD_TRAY_X1 + D.TRAY_RAIL_W / 2]
-    ym = (D.HDD_Y0 + D.HDD_Y1) / 2
-    rack_nofloor = rack.cut(box(D.CASE_LEFT, D.TRAY_Y0 - 1, D.RACK_Z0 - 1.0,
-                                D.CASE_RIGHT, D.HDD_Y1 + 1, D.HDD_Z0))
-    add("碟架承載料削掉 → lv0 導軌槽下方無料",
-        all(not V.pt_inside(rack_nofloor, x, ym, zr, 0.02) for x in xs_probe), "兩側都空")
-    add("現況 → lv0 導軌槽下方有承載料",
-        all(V.pt_inside(rack, x, ym, zr, 0.02) for x in xs_probe),
-        f"厚 {D.RACK_FLOOR_T - D.SLIDE_FIT:.2f} mm")
-
-    # 18. 右立板貼回碟的接頭端面 → 接頭與線完全沒有地方去
-    post_bad = box(D.HDD_X1, D.TRAY_Y0, D.RACK_Z0, D.HDD_X1 + D.RACK_WALL, D.HDD_Y1,
-                   D.RACK_TOP_Z1)
-    v = max(V.common_vol(post_bad, mocks[f"HDD_L{lv}_接頭"]) for lv in range(D.HDD_LEVELS))
-    add("右立板貼回碟端面 → 接頭區被實心料佔住", v > MAX, f"{v:.0f} mm3")
-    vn = max(V.common_vol(rack, mocks[f"HDD_L{lv}_接頭"]) for lv in range(D.HDD_LEVELS))
-    add("現況 → 接頭區淨空", vn <= MAX, f"{vn:.2f} mm3")
-
-    # 19. 碟架貼左內牆（第八輪佈局）→ 前罩開口嚴重不對稱
-    old_x0 = D.CASE_LEFT + D.WALL + D.RACK_WALL
-    old_l = (old_x0 - D.TRAY_RAIL_W - D.TOP_FIT_GAP) - D.CASE_LEFT
-    old_r = D.CASE_RIGHT - (old_x0 + D.HDD_L + D.TRAY_RAIL_W + D.TOP_FIT_GAP)
-    add("碟架貼左內牆 → 開口左右差很多", abs(old_l - old_r) > 1.0,
-        f"左 {old_l:.2f} / 右 {old_r:.2f}")
-    ml, mr = D.tray_opening_margin()
-    add("現況 → 開口左右對稱", abs(ml - mr) < 0.01, f"左 {ml:.2f} / 右 {mr:.2f}")
-
-    # 20. 層間零間隙：布林看不到（面接觸 common=0），只有量距離才看得出來
-    t_old = B.make_hdd_tray()
-    t_old.translate(App.Vector(0, 0, D.tray_z0(0) + D.HDD_H + D.TRAY_T))  # 舊 pitch
-    d_old = t_old.distToShape(mocks["HDD_L0"])[0]
-    t_new = B.make_hdd_tray_placed(1)
-    d_new = t_new.distToShape(mocks["HDD_L0"])[0]
-    add("舊 pitch = 碟厚+托盤 → 碟頂與上層托盤底距離 0（貼死）", d_old < 1e-6,
-        f"距離 {d_old:.4f} mm，而 common 只有 {V.common_vol(t_old, mocks['HDD_L0']):.2f} mm3")
-    add("現況 → 層間有氣隙", d_new >= 1.0 - 1e-6, f"距離 {d_new:.2f} mm")
-
-    # 21. 前罩沒有地板（第八輪）→ 機殼前段 53.76 mm 底下是開的
-    sh = S["Front_Shroud"]
-    sh_nofloor = sh.cut(box(D.CASE_LEFT, D.SHROUD_Y0 - D.SHROUD_LAP - 1, -0.5,
-                            D.CASE_RIGHT, D.CASE_FRONT + 1, D.FLOOR_T))
-    fp = (-150.0, D.CASE_FRONT - 20.0, D.FLOOR_T / 2)
-    add("前罩地板削掉 → 前段底下是空的", not V.pt_inside(sh_nofloor, *fp, 0.02), "探點無料")
-    add("現況 → 前罩地板實心", V.pt_inside(sh, *fp, 0.02), f"z={D.FLOOR_T / 2:.2f}")
-
-    # 22. 前罩搭接零間隙：nominal 0 的話 common 還是 0.000，只有量「間隙裡有沒有料」才抓得到
-    x_gap = D.CASE_LEFT + D.SHROUD_LAP_T + D.SLIDE_FIT / 2
-    y_lapm = D.BAY_SPLIT_Y - D.SHROUD_LAP / 2
-    shim = box(D.CASE_LEFT + D.SHROUD_LAP_T, y_lapm - 1, 80.0,
-               D.CASE_LEFT + D.SHROUD_LAP_T + D.SLIDE_FIT, y_lapm + 1, 100.0)
-    add("側板減薄量少了 SLIDE_FIT → 間隙裡被填滿（套不進去）",
-        V.pt_inside(side_l.fuse(shim), x_gap, y_lapm, 90.0, 0.02), "間隙有料")
-    add("現況 → 搭接間隙是空的",
-        not V.pt_inside(side_l, x_gap, y_lapm, 90.0, 0.02)
-        and not V.pt_inside(sh, x_gap, y_lapm, 90.0, 0.02), f"{D.SLIDE_FIT} mm/邊")
-
-    # 23. 底板槽開穿到牆底 → 那不是滑槽，是 L 形搭邊
-    xm_g = D.CASE_LEFT + D.WALL - D.FLOOR_LIP / 2
-    y_g = 60.0
-    side_open = side_l.cut(box(D.CASE_LEFT + D.WALL - D.FLOOR_LIP, D.CASE_REAR, -0.1,
-                               D.CASE_LEFT + D.WALL, D.BAY_SPLIT_Y, D.FLOOR_T - D.FLOOR_LIP_T))
-    add("底板槽開穿到牆底 → 槽下方無承載唇",
-        not V.pt_inside(side_open, xm_g, y_g, (D.FLOOR_T - D.FLOOR_LIP_T) / 2, 0.02), "下方無料")
-    add("現況 → 槽下方有承載唇",
-        V.pt_inside(side_l, xm_g, y_g, (D.FLOOR_T - D.FLOOR_LIP_T) / 2, 0.02),
-        f"唇高 {D.FLOOR_T - D.FLOOR_LIP_T:.2f}")
-
-    # 23b. 外殼長方體要用**體積**驗，不是 bbox。
-    #      目視複檢抓到的：同一個側板，GUI（已 tessellate）回報 XMin −215.5471、
-    #      headless 回報 −215.4900，差 0.057 —— 拿 ±0.05 的 bbox 門檻比，
-    #      同一份幾何在兩個環境會給出不同答案。布林量出來的 0 兩邊都是 0。
-    env = box(D.CASE_LEFT, D.CASE_REAR, -D.SKIRT_H, D.CASE_RIGHT, D.CASE_FRONT, D.OUTER_TOP_Z)
-    bump = Part.makeSphere(2.0)
-    bump.translate(App.Vector(D.CASE_LEFT, 100.0, 90.0))
-    add("側板長出 2 mm 凸包 → 外殼長方體檢查應紅", side_l.fuse(bump).cut(env).Volume > MAX,
-        f"{side_l.fuse(bump).cut(env).Volume:.1f} mm3")
-    worst = max((k, s.cut(env).Volume) for k, s in S.items()
-                if k not in ("PCIeBlank", "PCIeBar", "Rear_IO_PCIe"))
-    add("現況 → 沒有任何印件伸出長方體", worst[1] <= MAX, f"最大外溢 {worst[1]:.2f} mm3")
-
-    # 24. 前罩地板舌不讓開主板柱 → 滑進來的路上直接撞柱（最終位置也撞）
-    bands = B.shroud_floor_stud_bands()
-    tongue_bad = box(D.FLOOR_X0, D.SHROUD_Y0 - D.SHROUD_LAP,
-                     D.FLOOR_T - D.SHROUD_FLOOR_LAP_T + D.SLIDE_FIT,
-                     D.FLOOR_X1, D.SHROUD_Y0, D.FLOOR_T)
-    add("前罩地板舌不讓開主板柱 → 撞柱", V.common_vol(tongue_bad, tray) > MAX,
-        f"{V.common_vol(tongue_bad, tray):.0f} mm3（{len(bands)} 根柱）")
-    add("現況 → 前罩與底板不干涉", V.common_vol(sh, tray) <= MAX,
-        f"{V.common_vol(sh, tray):.2f} mm3")
-
-    # 14. 螺絲／銅母參數若復活，「無螺絲」那條要紅
-    gone = [g for g in ("M3_CLR", "M3_INSERT_D", "M3_BOSS_L", "M3_BASE_Z",
-                        "TOP_SCREW_BOSS_D", "CAGE_LAP_W", "TOP_SEAM_Y") if hasattr(D, g)]
-    add("現況 → 螺絲／銅母／搭接片參數全數不存在", not gone, f"殘留 {gone}" if gone else "0 個")
-
-    # 15. Area A 淨空必須由 max(實測, 規格 required) 導出（改一個沒改另一個就該紅）
-    add("現況 → Area A 淨空 = max(實測散熱器, Table 6 required)（導出）",
-        abs(D.AREA_A_CLEARANCE - max(D.COOLER_MAX_H, D.AREA_A_SPEC_REQUIRED)) < 1e-9,
-        f"{D.AREA_A_CLEARANCE} = max({D.COOLER_MAX_H}, {D.AREA_A_SPEC_REQUIRED})")
-    add("現況 → 規格 literal 沒被改掉（76.20 / 88.90 還在）",
-        abs(D.AREA_A_SPEC_REQUIRED - 76.20) < 1e-9
-        and abs(D.AREA_A_SPEC_RECOMMENDED - 88.90) < 1e-9,
-        f"{D.AREA_A_SPEC_REQUIRED} / {D.AREA_A_SPEC_RECOMMENDED}")
-
-    # 16. 托盤厚度若偏離，#6-32 穿入量就掉出 SFF-8301 的 2.39–3.56
-    for t_bad in (1.0, 4.5):
-        pen = 6.35 - t_bad
-        add(f"托盤厚 {t_bad} → 穿入 {pen:.2f} 掉出 SFF-8301 區間",
-            not (2.39 <= pen <= 3.56), f"{pen:.2f}")
-    pen = 6.35 - D.TRAY_T
-    add("現況 → 穿入量落在 2.39–3.56", 2.39 <= pen <= 3.56, f"{pen:.2f}")
-
-    # ══ 第十輪新增 ═════════════════════════════════════════════════
-    # 25. 電源留在第九輪的高度 → Area A 只有 50.00，達不到 Table 6 required
-    old_clear = 50.0
-    add("電源留在舊高度 → Area A 50.00 < required 76.20 應紅",
-        old_clear < D.AREA_A_SPEC_REQUIRED,
-        f"{old_clear:.2f} < {D.AREA_A_SPEC_REQUIRED:.2f}（第九輪就是這樣，靠 WARN 掛著）")
-    add("現況 → Area A 已達 required", D.AREA_A_CLEARANCE >= D.AREA_A_SPEC_REQUIRED,
-        f"{D.AREA_A_CLEARANCE:.2f} >= {D.AREA_A_SPEC_REQUIRED:.2f}")
-    add("現況 → 電源頂上的死空間已收掉", D.PSU_CLEAR_ABOVE <= 6.0,
-        f"剩 {D.PSU_CLEAR_ABOVE:.2f} mm（第九輪 27.50）")
-
-    # 26. 電源貼回左內牆 → 撞頂蓋往下垂的側舌（升上去之後兩者的 Z 帶是重疊的）
-    psu_left = box(D.FLOOR_X0, D.ATX_Y0, D.ATX_Z0, D.FLOOR_X0 + D.ATX_W, D.ATX_Y1, D.ATX_Z1)
-    add("電源貼回左內牆 → 撞頂蓋側舌", V.common_vol(psu_left, top) > MAX,
-        f"{V.common_vol(psu_left, top):.0f} mm3")
-    add("現況 → 電源讓開了頂蓋側舌",
-        V.common_vol(mocks["PSU_150x86x140"], top) <= MAX,
-        f"{V.common_vol(mocks['PSU_150x86x140'], top):.2f} mm3")
-
-    # 27. ATX 四孔不翻轉 → 「翻回去等於 Fig.4 literal」那條要紅
-    spec4 = tuple(sorted(D.ATX_HOLES_SPEC))
-    unflipped_back = tuple(sorted((D.ATX_W - x, D.ATX_H - z) for x, z in spec4))
-    add("四孔忘了翻轉 → 翻回去不等於 Fig.4 literal",
-        unflipped_back != spec4, f"{unflipped_back} != {spec4}")
-    flipped_back = tuple(sorted((D.ATX_W - x, D.ATX_H - z) for x, z in D.ATX_HOLES))
-    add("現況 → 翻回去正好等於 Fig.4 literal", flipped_back == spec4, f"{flipped_back}")
-
-    # 28. 底板不內縮（本體＝內腔寬）→ 兩側零間隙，250 mm 跨距上裝不進去
-    slab_bad = box(D.FLOOR_X0, D.FLOOR_Y0, 0.0, D.FLOOR_X1, D.FLOOR_Y1, D.FLOOR_T)
-    # 探點只能取**承載唇那一段**：舌本來就伸過去，用整個 z 帶會把舌算進來
-    gap_probe = box(D.FLOOR_X0, 100.0, 0.3, D.FLOOR_X0 + D.SLIDE_FIT, 110.0, D.FLOOR_LEDGE_T)
-    add("底板不內縮 → 側緣與牆內面共面（零間隙）",
-        V.common_vol(slab_bad, gap_probe) > 0.5, f"{V.common_vol(slab_bad, gap_probe):.2f} mm3")
-    add("現況 → 底板側緣留了滑配", V.common_vol(tray, gap_probe) <= 0.5,
-        f"{V.common_vol(tray, gap_probe):.2f} mm3")
-
-    # 29. 後牆的底板槽開穿到牆底 → 舌下方沒有承載料（第九輪就是這樣，只修了側板）
-    y_rg = D.CASE_REAR + D.WALL - D.FLOOR_LIP / 2
-    rear_bad = rear.cut(
-        box(D.FLOOR_X0 - 2.0, D.CASE_REAR + D.WALL - D.FLOOR_LIP - D.SLIDE_FIT, -0.1,
-            D.FLOOR_X1 + 2.0, D.CASE_REAR + D.WALL + 0.1, D.FLOOR_LEDGE_T)
+    old_pcb = box(
+        D.BOARD_LEFT, -22.86, D.BOARD_TOP_Z - D.PCB_T,
+        D.BOARD_RIGHT, 220.98, D.BOARD_TOP_Z,
     )
-    add("後牆槽開穿到牆底 → 舌下方無承載料",
-        not V.pt_inside(rear_bad, -60.0, y_rg, D.FLOOR_LEDGE_T / 2, 0.02), "槽下方 = 空氣")
-    add("現況 → 後牆槽下方有承載料",
-        V.pt_inside(rear, -60.0, y_rg, D.FLOOR_LEDGE_T / 2, 0.02), f"唇高 {D.FLOOR_LEDGE_T:.2f}")
+    hole_r = D.PCB_HOLE_D / 2
+    for x, y in old_holes.values():
+        old_pcb = old_pcb.cut(
+            box(x - hole_r, y - hole_r, D.BOARD_TOP_Z - D.PCB_T - 1,
+                x + hole_r, y + hole_r, D.BOARD_TOP_Z + 1)
+        )
+    add("舊 Fig.7 誤讀孔位復活 → PCB 被支撐肩戳穿",
+        V.common_vol(old_pcb, chassis) > limit,
+        f"{V.common_vol(old_pcb, chassis):.1f} mm³")
+    add("現況 Fig.7 九孔 → PCB 與 Chassis 淨空",
+        V.common_vol(mocks["主板PCB"], chassis) <= limit,
+        f"{V.common_vol(mocks['主板PCB'], chassis):.2f} mm³")
 
-    # 30. 頂蓋側舌回到第九輪的 0.40 咬合 → 咬合量檢查要紅
-    old_eng = D.TOP_LIP - 2 * D.TOP_FIT_GAP
-    add("頂蓋側舌回到第九輪算法 → 咬合只剩 0.40", old_eng < 1.0, f"{old_eng:.2f} mm")
-    add("現況 → 頂蓋側舌咬合 >= 1.0", D.TOP_LIP >= 1.0, f"{D.TOP_LIP:.2f} mm")
+    low_psu = box(
+        D.ATX_X0, D.ATX_Y0, D.FLOOR_T,
+        D.ATX_X1, D.ATX_Y1, D.FLOOR_T + D.ATX_H,
+    )
+    add("PSU 放回板下 → 吃掉 PCB",
+        V.common_vol(low_psu, mocks["主板PCB"]) > limit,
+        f"{V.common_vol(low_psu, mocks['主板PCB']):.0f} mm³")
+    add("現況 PSU 上置 → PCB 淨空",
+        V.common_vol(mocks["PSU_150x86x140"], mocks["主板PCB"]) <= limit,
+        f"{V.common_vol(mocks['PSU_150x86x140'], mocks['主板PCB']):.2f} mm³")
 
-    # 31. 側板搭接帶整片減薄 → 三道內面滑槽的背後被切穿
-    lap_all = box(D.CASE_LEFT, D.BAY_SPLIT_Y - D.SHROUD_LAP, 0.0,
-                  D.CASE_LEFT + D.SHROUD_LAP_T + D.SLIDE_FIT, D.BAY_SPLIT_Y + 0.1, D.OUTER_TOP_Z)
-    side_bad = side_l.cut(lap_all)
-    y_lap_n = D.BAY_SPLIT_Y - D.SHROUD_LAP / 2
-    x_back_n = D.CASE_LEFT + (D.WALL - (D.TOP_LIP + D.SLIDE_FIT)) / 2
-    add("搭接帶整片減薄 → 頂蓋槽背後被切穿",
-        not V.pt_inside(side_bad, x_back_n, y_lap_n, D.INNER_TOP_Z - D.TOP_T / 2, 0.02),
-        "1.6 槽 + 1.5 減薄 = 3.1 > 牆厚 2.4")
-    add("現況 → 那三段不減薄，槽背後還有牆料",
-        V.pt_inside(side_l, x_back_n, y_lap_n, D.INNER_TOP_Z - D.TOP_T / 2, 0.02),
-        f"keep 帶 {B.side_lap_keep_bands()}")
+    add("Area A 舊值 50.00 → 低於 Table 6 required",
+        50.0 < D.AREA_A_SPEC_REQUIRED,
+        f"50.00 < {D.AREA_A_SPEC_REQUIRED:.2f}")
+    add("現況 Area A 由 required literal 導出",
+        abs(D.AREA_A_CLEARANCE - max(D.COOLER_MAX_H, D.AREA_A_SPEC_REQUIRED)) < 1e-9
+        and D.AREA_A_SPEC_REQUIRED == 76.20
+        and D.AREA_A_SPEC_RECOMMENDED == 88.90,
+        f"{D.AREA_A_CLEARANCE:.2f} / {D.AREA_A_SPEC_REQUIRED:.2f} / {D.AREA_A_SPEC_RECOMMENDED:.2f}")
 
-    # 32. PCIe 窗框只補肋、不補框 → 底檻與左右柱回到 2.4
+    # ── 主板盲內牙與印製螺絲 ───────────────────────────────────────
+    x, y = D.HOLES_MM["B"]
+    placed = B.place_mb_screw(B.make_mb_screw(), x, y)
+    phase0 = V.common_vol(placed, chassis)
+    phase180_shape = placed.copy()
+    phase180_shape.rotate(App.Vector(x, y, 0), App.Vector(0, 0, 1), 180.0)
+    phase180 = V.common_vol(phase180_shape, chassis)
+    add("現況螺絲工作相位可旋入", phase0 <= limit, f"{phase0:.2f} mm³")
+    add("現況螺絲相位轉 180° → 真螺旋牙碰撞", phase180 > limit, f"{phase180:.2f} mm³")
+
+    fake = Part.makeCylinder(D.MB_THREAD_MINOR / 2, D.MB_SCREW_THREAD_LEN)
+    fake = B.place_mb_screw(fake, x, y)
+    fake180 = fake.copy()
+    fake180.rotate(App.Vector(x, y, 0), App.Vector(0, 0, 1), 180.0)
+    fake0_v = V.common_vol(fake, chassis)
+    fake180_v = V.common_vol(fake180, chassis)
+    add("軸對稱假牙復活 → 轉 180° 仍不撞，應被相位檢查拒絕",
+        fake0_v <= limit and fake180_v <= limit,
+        f"0°/180°={fake0_v:.2f}/{fake180_v:.2f} mm³")
+
+    through = Part.makeCylinder(
+        D.MB_THREAD_MAJOR / 2 + D.MB_THREAD_GAP,
+        D.SHOULDER_TOP_Z + 1.0,
+        App.Vector(x, y, -0.5),
+    )
+    through_chassis = chassis.cut(through)
+    bottom_probe = (x, y, D.MB_SOCKET_BOTTOM_Z - 0.3)
+    add("盲孔打穿到地板 → 孔底探點變空",
+        not inside(through_chassis, bottom_probe),
+        f"probe z={bottom_probe[2]:.2f}")
+    add("現況盲孔底保留實料", inside(chassis, bottom_probe),
+        f"底料 {D.MB_SOCKET_BOTTOM_MATERIAL:.2f} mm")
+
+    stud = Part.makeCylinder(
+        D.MB_THREAD_MAJOR / 2,
+        D.PCB_T + 2.0,
+        App.Vector(x, y, D.SHOULDER_TOP_Z),
+    )
+    stud_chassis = chassis.fuse(stud)
+    above = (x, y, D.BOARD_TOP_Z + 1.0)
+    add("外凸 male stud 復活 → PCB 上方中心有 Chassis 料",
+        inside(stud_chassis, above), f"probe z={above[2]:.2f}")
+    add("現況 PCB 上方無固定柱", not inside(chassis, above),
+        f"probe z={above[2]:.2f}")
+
+    # ── 一體 Chassis 與 A1 ──────────────────────────────────────────
+    overlap_point = (D.FLOOR_X0 - D.CHASSIS_OVERLAP / 2, 80.0, D.FLOOR_T / 2)
+    slit = box(
+        D.FLOOR_X0 - D.CHASSIS_OVERLAP - 0.1, D.FLOOR_Y0, -0.1,
+        D.FLOOR_X0 + 0.1, D.BAY_SPLIT_Y, D.FLOOR_T + 0.1,
+    )
+    no_left_root = chassis.cut(slit)
+    add("地板／左牆 overlap 被切斷 → 根部探點變空",
+        not inside(no_left_root, overlap_point), "左根無料")
+    add("現況地板／左牆根部實心", inside(chassis, overlap_point),
+        f"overlap={D.CHASSIS_OVERLAP:.2f} mm")
+
+    old_hook = box(
+        min(D.pcie_centers()) - 10.0, D.CASE_REAR - 8.0, D.PCIE_BAR_Z0,
+        D.CASE_RIGHT, D.CASE_REAR + 0.5, D.PCIE_BAR_Z1_TOP,
+    )
+    old_chassis = chassis.fuse(old_hook)
+    old_bb = V.obb(old_chassis)
+    old_support_y = old_bb.YLength + 2 * 0.62
+    add("8 mm keyhole 後凸復活 → normal support 代理超出 A1",
+        old_support_y > D.A1_MAX,
+        f"Y {old_bb.YLength:.2f} + 1.24 = {old_support_y:.2f}")
+    bb = V.obb(chassis)
+    add("現況 Chassis 裸件 OBB 在 A1 內",
+        max(bb.XLength, bb.YLength, bb.ZLength) <= D.A1_MAX,
+        f"{bb.XLength:.2f}×{bb.YLength:.2f}×{bb.ZLength:.2f}")
+
+    stale_keys = {"Bottom_Tray", "Rear_IO_PCIe", "Side_Left_MB", "Side_Right_MB", "MB_Nut"}
+    add("現況 CAD 沒有退役四件與 MB_Nut",
+        not (set(shapes) & stale_keys), f"殘留={sorted(set(shapes) & stale_keys)}")
+    add("現況 CAD 可列印物件集合等於 manifest",
+        set(shapes) == set(D.STL_NAMES),
+        f"{len(shapes)}/{len(D.STL_NAMES)}")
+
+    # ── HDD Rack 底部格柵／舊 HDD 病灶 ─────────────────────────────
+    zc = (D.RACK_Z0 + D.RACK_BASE_Z1) / 2
+    center = (D.RACK_BASE_SPINE_X, D.RACK_BASE_BEAM_Y[1], zc)
+    grid_cut = box(
+        center[0] - 2.0, center[1] - 2.0, D.RACK_Z0 - 0.1,
+        center[0] + 2.0, center[1] + 2.0, D.RACK_BASE_Z1 + 0.1,
+    )
+    rack_broken = rack.cut(grid_cut)
+    add("格柵中央交叉點切掉 → 中央載荷路徑斷",
+        not inside(rack_broken, center), "center probe empty")
+    add("現況三橫樑／中央縱樑交叉點實心", inside(rack, center),
+        f"z={zc:.2f}")
+
+    gap_fill = box(
+        center[0] - 3.0, center[1] - 3.0, D.RACK_BASE_Z1,
+        center[0] + 3.0, center[1] + 3.0, D.HDD_Z0 + 0.2,
+    )
+    rack_zero_gap = rack.fuse(gap_fill)
+    tray0 = B.make_hdd_tray_placed(0)
+    add("格柵抬到 lv0 托盤底 → 零間隙／干涉",
+        V.common_vol(rack_zero_gap, tray0) > limit,
+        f"{V.common_vol(rack_zero_gap, tray0):.2f} mm³")
+    add("現況格柵與 lv0 托盤保留滑配",
+        V.common_vol(rack, tray0) <= limit,
+        f"{V.common_vol(rack, tray0):.2f} mm³")
+
+    connector_post = box(
+        D.HDD_X1, D.TRAY_Y0, D.RACK_Z0,
+        D.HDD_X1 + D.RACK_WALL, D.HDD_Y1, D.RACK_TOP_Z1,
+    )
+    connector_hit = max(
+        V.common_vol(connector_post, mocks[f"HDD_L{level}_接頭"])
+        for level in range(D.HDD_LEVELS)
+    )
+    add("右立板貼回 HDD 接頭端面 → 四層接頭區被佔",
+        connector_hit > limit, f"{connector_hit:.0f} mm³")
+    add("現況四層 HDD 接頭區淨空",
+        max(V.common_vol(rack, mocks[f"HDD_L{level}_接頭"])
+            for level in range(D.HDD_LEVELS)) <= limit,
+        "4/4 clear")
+
+    card230_hit = 0.0
+    y_inner = D.CASE_REAR + D.WALL
+    for cx in D.pcie_centers():
+        card230 = box(
+            cx - D.PCIE_CARD_HALF_W, y_inner, D.PCIE_CARD_Z0,
+            cx + D.PCIE_CARD_HALF_W, y_inner + 230.0, D.PCIE_CARD_Z1,
+        )
+        card230_hit = max(card230_hit, V.common_vol(card230, rack))
+    add("PCIe 卡長復活為 230 → 插進置中 Rack", card230_hit > limit,
+        f"{card230_hit:.0f} mm³")
+    add("現況 189 mm PCIe 卡讓開 Rack",
+        max(V.common_vol(rack, mocks[f"PCIe{i}_card"])
+            for i in range(D.PCIE_COUNT)) <= limit,
+        "4/4 clear")
+
+    old_pitch_tray = B.make_hdd_tray()
+    old_pitch_tray.translate(App.Vector(0, 0, D.tray_z0(0) + D.HDD_H + D.TRAY_T))
+    old_gap = old_pitch_tray.distToShape(mocks["HDD_L0"])[0]
+    new_gap = B.make_hdd_tray_placed(1).distToShape(mocks["HDD_L0"])[0]
+    add("舊 tray pitch 復活 → HDD 頂與上層托盤貼死", old_gap < 1e-6,
+        f"gap={old_gap:.4f}")
+    add("現況層間氣隙非零", new_gap >= 1.0 - 1e-6,
+        f"gap={new_gap:.2f}")
+
+    # ── Top／Front ──────────────────────────────────────────────────
+    detents = B.top_detents()
+    no_top_detent = chassis
+    for detent in B.top_detents(0.05):
+        no_top_detent = no_top_detent.cut(detent)
+    add("Top detent 從 Chassis 削掉 → 公球交集歸零",
+        max(V.common_vol(no_top_detent, d) for d in detents) <= 0.05,
+        "0/2 male")
+    add("現況 Top 兩顆公球與 Chassis 融合",
+        min(V.common_vol(chassis, d) for d in detents) > 0.05,
+        "2/2 male")
+
+    top_filled = top
+    for detent in detents:
+        top_filled = top_filled.fuse(detent)
+    add("Top 母坑填回 → 與 Chassis 公球碰撞",
+        V.common_vol(top_filled, chassis) > limit,
+        f"{V.common_vol(top_filled, chassis):.2f} mm³")
+    add("現況 Top 母坑讓開公球",
+        V.common_vol(top, chassis) <= limit,
+        f"{V.common_vol(top, chassis):.2f} mm³")
+
+    old_engagement = D.TOP_LIP - 2 * D.TOP_FIT_GAP
+    add("Top 舊算法復活 → 側舌咬合只剩 0.40 mm",
+        old_engagement < 1.0, f"{old_engagement:.2f} mm")
+    add("現況 Top 側舌咬合 >=1 mm", D.TOP_LIP >= 1.0,
+        f"{D.TOP_LIP:.2f} mm")
+
+    y0 = D.SHROUD_Y0 - D.SHROUD_LAP
+    lead_empty = (
+        D.CASE_LEFT + D.SHROUD_LAP_T - 0.25,
+        y0 + 0.25,
+        90.0,
+    )
+    shroud_no_lead = shroud.fuse(
+        box(lead_empty[0] - 0.3, lead_empty[1] - 0.3, 89.5,
+            lead_empty[0] + 0.3, lead_empty[1] + 0.3, 90.5)
+    )
+    add("Front 導入面填回 → leading probe 變實心",
+        inside(shroud_no_lead, lead_empty), "lead-in missing")
+    add("現況 Front 45° leading probe 是空的",
+        not inside(shroud, lead_empty), f"lead={D.SHROUD_LEAD_IN:.2f} mm")
+    add("Front 舊搭接 12 mm 復活 → 未達本輪 14 mm literal",
+        12.0 < D.SHROUD_LAP, f"12.0 < {D.SHROUD_LAP:.1f}")
+
+    shroud_nofloor = shroud.cut(
+        box(D.CASE_LEFT, D.SHROUD_Y0 - D.SHROUD_LAP - 1, -0.5,
+            D.CASE_RIGHT, D.CASE_FRONT + 1, D.FLOOR_T)
+    )
+    floor_probe = (-150.0, D.CASE_FRONT - 20.0, D.FLOOR_T / 2)
+    add("Front 地板削掉 → 前段底部開口", not inside(shroud_nofloor, floor_probe),
+        "floor probe empty")
+    add("現況 Front 地板實心", inside(shroud, floor_probe),
+        f"z={floor_probe[2]:.2f}")
+
+    front_public = (
+        B.shroud_detents(True) + B.shroud_detents(False)
+        + B.shroud_lap_detents(False)
+    )
+    shroud_filled = shroud
+    for detent in front_public:
+        shroud_filled = shroud_filled.fuse(detent)
+    add("Front detent 母坑填回 → Chassis 公球碰撞",
+        V.common_vol(shroud_filled, chassis) > limit,
+        f"{V.common_vol(shroud_filled, chassis):.2f} mm³")
+    add("現況 Front／Chassis 落位不干涉",
+        V.common_vol(shroud, chassis) <= limit,
+        f"{V.common_vol(shroud, chassis):.2f} mm³")
+
+    # ── PCIe 鎖點盲內牙／Bar（第十三輪：#6-32 自攻 → 印製盲內牙）─────
+    mount_y = D.pcie_bar_mount_y()
+    lock_x = D.pcie_lock_x()
+
+    socket_cut = Part.makeCylinder(
+        D.MB_THREAD_MAJOR / 2 + 0.3,
+        D.PCIE_RIB_D + D.WALL + 1.0,
+        App.Vector(lock_x[0], mount_y - 0.1, D.PCIE_LOCK_Z),
+        App.Vector(0, 1, 0),
+    )
+    pierced = chassis.cut(socket_cut)
+    blind_probe = (lock_x[0], D.pcie_lock_socket_end() + 0.3, D.PCIE_LOCK_Z)
+    add("PCIe 盲牙打穿內壁 → 盲端 probe 變空",
+        not inside(pierced, blind_probe), "through hole")
+    add("現況 PCIe 盲牙盲端有料", inside(chassis, blind_probe),
+        f"{(D.CASE_REAR + D.WALL) - D.pcie_lock_socket_end():.2f} mm inner wall")
+
+    # 盲牙必須是真螺旋：把螺絲相位轉 180° 一定要撞（排除軸對稱假牙）
+    turned = B.place_pcie_lock_screw(B.make_mb_screw(), lock_x[0])
+    turned.rotate(App.Vector(lock_x[0], 0, D.PCIE_LOCK_Z), App.Vector(0, 1, 0), 180.0)
+    add("壓條螺絲相位轉 180° → 撞盲內牙", V.common_vol(turned, chassis) > limit,
+        f"{V.common_vol(turned, chassis):.2f} mm³")
+    aligned = B.place_pcie_lock_screw(B.make_mb_screw(), lock_x[0])
+    add("現況壓條螺絲工作相位可旋入", V.common_vol(aligned, chassis) <= limit,
+        f"{V.common_vol(aligned, chassis):.2f} mm³")
+
+    hole_y = mount_y - D.PCIE_BAR_SEAT_T / 2
+    hole_probe = (lock_x[0], hole_y, D.PCIE_LOCK_Z)
+    filled_hole = bar.fuse(
+        Part.makeCylinder(
+            D.PCIE_BAR_HOLE_D / 2,
+            D.PCIE_BAR_T + 1.0,
+            App.Vector(lock_x[0], mount_y - D.PCIE_BAR_T - 0.5, D.PCIE_LOCK_Z),
+            App.Vector(0, 1, 0),
+        )
+    )
+    add("PCIeBar 通孔填回 → 孔中心變實心", inside(filled_hole, hole_probe),
+        "clearance hole missing")
+    add("現況 PCIeBar 兩通孔開通",
+        all(not inside(bar, (hx, hole_y, D.PCIE_LOCK_Z)) for hx in lock_x),
+        "2/2 clear")
+
+    cbore_probe = (lock_x[0], mount_y - D.PCIE_BAR_T + 0.4, D.PCIE_LOCK_Z)
+    filled_cbore = bar.fuse(
+        Part.makeCylinder(
+            D.PCIE_BAR_CBORE_D / 2,
+            D.PCIE_BAR_T - D.PCIE_BAR_SEAT_T,
+            App.Vector(lock_x[0], mount_y - D.PCIE_BAR_T, D.PCIE_LOCK_Z),
+            App.Vector(0, 1, 0),
+        )
+    )
+    add("PCIeBar 沉頭凹填回 → 螺絲頭沒地方沉", inside(filled_cbore, cbore_probe),
+        "counterbore missing")
+    add("現況 PCIeBar 沉頭凹開通", not inside(bar, cbore_probe),
+        f"depth {D.PCIE_BAR_T - D.PCIE_BAR_SEAT_T:.2f} >= head {D.MB_SCREW_HEAD_H}")
+
+    first_cx = D.pcie_centers()[0]
+    tab_probe = (
+        first_cx,
+        (mount_y + D.CASE_REAR) / 2,
+        (D.PCIE_BAR_Z0 + D.PCIE_BAR_Z1) / 2,
+    )
+    missing_tab = bar.cut(
+        box(first_cx - D.PCIE_BAR_TAB_W / 2 - 0.2, mount_y - 0.6, D.PCIE_BAR_Z0 - 0.2,
+            first_cx + D.PCIE_BAR_TAB_W / 2 + 0.2, D.CASE_REAR + D.PCIE_BAR_TAB_D + 0.2,
+            D.PCIE_BAR_Z1 + 0.2)
+    )
+    add("PCIeBar 少一壓舌 → 第一槽 probe 變空", not inside(missing_tab, tab_probe),
+        "tab0 missing")
+    add("現況 PCIeBar 四壓舌皆實心",
+        all(inside(bar, (cx, tab_probe[1], tab_probe[2])) for cx in D.pcie_centers()),
+        "4/4 solid")
+
+    screw_mocks = [B.place_pcie_lock_screw(B.make_mb_screw(), hx)
+                   for hx in lock_x]
+    bar_pull = sweep(bar, dy=-1.0, steps=4)
+    add("兩顆壓條螺絲在位 → Bar 外抽會撞螺絲頭",
+        all(V.common_vol(bar_pull, screw) > limit for screw in screw_mocks),
+        str([round(V.common_vol(bar_pull, screw), 1) for screw in screw_mocks]))
+    bar_exit = sweep(bar, dy=-(D.PCIE_BAR_T + D.PCIE_RIB_D + 10.0))
+    add("卸兩螺絲後 → Bar 沿 −Y 抽離 Chassis",
+        V.common_vol(bar_exit, chassis) <= limit,
+        f"{V.common_vol(bar_exit, chassis):.2f} mm³")
+
+    held = sum(
+        V.common_vol(sweep(mocks[f"PCIe{i}_耳keepout"], dz=D.PCIE_ENGAGE), bar) > limit
+        for i in range(D.PCIE_COUNT)
+    )
+    add("Bar 在位 → 四槽都不能抬升", held == D.PCIE_COUNT, f"{held}/4")
+    cleared = max(
+        V.common_vol(sweep(mocks[f"PCIe{i}_card"], dz=D.PCIE_ENGAGE), chassis)
+        for i in range(D.PCIE_COUNT)
+    )
+    add("拆 Bar 後 → 四張卡可抬升", cleared <= limit, f"max={cleared:.2f} mm³")
+
+    actual_ymin = min(
+        [V.obb(chassis).YMin, V.obb(bar).YMin]
+        + [V.obb(screw).YMin for screw in screw_mocks]
+    )
+    measured = D.CASE_REAR - actual_ymin
+    add("只把 Bar 厚度當後凸 → 少報完整螺絲頭",
+        D.PCIE_BAR_T < measured, f"{D.PCIE_BAR_T:.2f} < {measured:.2f}")
+    add("現況 install_depth 對上 Chassis+Bar+螺絲頭真幾何",
+        abs(D.install_depth_mm() - (D.CASE_D + measured)) < 0.05,
+        f"{D.install_depth_mm():.2f} vs {D.CASE_D + measured:.2f}")
+
+    # ── 其餘仍有效的邊界病灶 ───────────────────────────────────────
+    skirt = box(D.CASE_LEFT, D.CASE_REAR, -10.0, D.CASE_RIGHT, D.CASE_FRONT, 0.0)
+    add("舊下裙復活 → z<0 有料", V.obb(skirt).ZMin < -0.05,
+        f"ZMin={V.obb(skirt).ZMin:.1f}")
+    add("現況 Chassis 無 z<0 料", V.obb(chassis).ZMin >= -0.05,
+        f"ZMin={V.obb(chassis).ZMin:.2f}")
+
+    old_t = 1.0
+    old_penetration = 6.35 - old_t
+    add("HDD 托盤厚復活為 1 mm → 螺絲穿入超標",
+        not (2.39 <= old_penetration <= 3.56),
+        f"{old_penetration:.2f} mm")
+    penetration = 6.35 - D.TRAY_T
+    add("現況 HDD 螺絲穿入落在 SFF-8301 區間",
+        2.39 <= penetration <= 3.56,
+        f"{penetration:.2f} mm")
+
+    button = mocks["電源按鈕本體"]
+    add("現況 22 mm 深電源按鈕不撞印件",
+        max(V.common_vol(button, shape) for shape in shapes.values()) <= limit,
+        "clear")
+    button_bad = box(
+        -100.0 - D.PWR_BTN_NUT_D / 2,
+        D.CASE_FRONT - D.TRAY_FACE_T - D.PWR_BTN_DEPTH,
+        60.0 - D.PWR_BTN_NUT_D / 2,
+        -100.0 + D.PWR_BTN_NUT_D / 2,
+        D.CASE_FRONT - D.TRAY_FACE_T,
+        60.0 + D.PWR_BTN_NUT_D / 2,
+    )
+    add("按鈕移到 Rack X/Z 帶 → 撞印件",
+        max(V.common_vol(button_bad, rack), V.common_vol(button_bad, shroud),
+            V.common_vol(button_bad, tray)) > limit,
+        "bad placement collides")
+
+    gap_probe = box(
+        D.HDD_X0 + 5, D.TRAY_Y0 + 5, D.RACK_TOP_Z1 + 0.05,
+        D.HDD_X1 - 5, D.BAY_SPLIT_Y - 5, D.INNER_TOP_Z - 0.05,
+    )
+    gap_bridge = box(
+        D.HDD_X0 + 5, D.TRAY_Y0 + 5, D.RACK_TOP_Z1 - 0.1,
+        D.HDD_X1 - 5, D.BAY_SPLIT_Y - 5, D.INNER_TOP_Z + 0.1,
+    )
+    add("Top/Rack 間隙填料復活 → 零間隙檢查應紅",
+        V.common_vol(rack.fuse(gap_bridge), top) > limit,
+        f"{V.common_vol(rack.fuse(gap_bridge), top):.2f} mm³")
+    add("現況 Top/Rack 間隙為空",
+        max(V.common_vol(gap_probe, shape) for shape in shapes.values()) <= limit,
+        f"gap={D.RACK_TOP_GAP:.2f} mm")
+
+    old_names = {"底板_主板托盤.stl", "後牆_IO與PCIe.stl", "左側板_主板段.stl",
+                 "右側板_主板段.stl", "主板壓帽.stl"}
+    actual_stl = {
+        name for name in os.listdir(V.STL_DIR)
+        if name.lower().endswith(".stl")
+    }
+    add("現況 STL 目錄沒有退役輸出", not (actual_stl & old_names),
+        f"stale={sorted(actual_stl & old_names)}")
+    add("現況 STL 目錄雙向等於 manifest",
+        actual_stl == set(D.STL_NAMES.values()),
+        f"{len(actual_stl)}/{len(D.STL_NAMES)}")
+
+    # ── 第十三輪：五項使用者實印回報 ─────────────────────────────
+    # ① I/O 深度基準（Fig.4 側視 12.27）。舊式 CASE_REAR = 板緣 − MARGIN − WALL
+    #    讓後牆內面落在 −10.66，而連接器面在 −11.30 → 板推不到底。
+    conn = mocks["IO連接器區"]
+    add("現況 I/O 連接器區與 Chassis 不干涉",
+        V.common_vol(conn, chassis) <= limit,
+        f"{V.common_vol(conn, chassis):.2f} mm³")
+    old_rear_wall = box(
+        D.IO_X0, D.BOARD_REAR - 0.5 - D.WALL, D.IO_Z0,
+        D.IO_X1, D.BOARD_REAR - 0.5, D.IO_Z1,
+    )
+    add("後牆退回舊基準（板緣 − MARGIN − WALL）→ 壓到 I/O 連接器",
+        V.common_vol(conn, old_rear_wall) > limit,
+        f"{V.common_vol(conn, old_rear_wall):.2f} mm³")
+
+    # ② 碟架承托肩
+    ledge_probe = (
+        D.CASE_LEFT + D.WALL + D.RACK_LEDGE_D / 2,
+        (D.RACK_LEDGE_Y0 + D.RACK_LEDGE_Y1) / 2,
+        D.RACK_LEDGE_Z1 - 0.5,
+    )
+    ledge_cut = box(
+        D.CASE_LEFT + D.WALL - 0.2, D.RACK_LEDGE_Y0 - 0.2,
+        D.RACK_LEDGE_Z0 - D.RACK_LEDGE_GUSSET - 0.2,
+        D.CASE_LEFT + D.WALL + D.RACK_LEDGE_D + 0.2, D.RACK_LEDGE_Y1 + 0.2,
+        D.RACK_LEDGE_Z1 + 0.2,
+    )
+    add("碟架承托肩切掉 → 承重面 probe 變空",
+        not inside(chassis.cut(ledge_cut), ledge_probe), "ledge missing")
+    add("現況碟架承托肩實心", inside(chassis, ledge_probe),
+        f"{D.RACK_LEDGE_D} mm 承重寬")
+    shroud_ledge_probe = (
+        D.CASE_LEFT + D.SHROUD_WALL + D.SHROUD_LEDGE_D / 2,
+        (D.SHROUD_LEDGE_Y0 + D.SHROUD_LEDGE_Y1) / 2,
+        D.RACK_LEDGE_Z1 - 0.5,
+    )
+    add("現況前罩承托肩實心（碟架前段不再是懸臂）",
+        inside(shroud, shroud_ledge_probe),
+        f"懸臂 {D.HDD_Y1 - max(D.RACK_BEAM_Y):.2f} mm")
+
+    # ③ PCIe 45° 尖頂：頂改回矩形 → 開孔頂又是水平懸空
+    cx0 = D.pcie_centers()[0]
+    y_wall = D.CASE_REAR + D.WALL / 2
+    # 探點要放在**收斂線之外**：尖頂的中線在任何高度都還是開孔（空的），
+    # 有料的是 |x − cx| 大於該高度半寬的地方。
+    apex_frac = 0.6
+    apex_half = (1.0 - apex_frac) * D.PCIE_OPEN_W / 2
+    apex_probe = (
+        cx0 + apex_half + 0.4,
+        y_wall,
+        D.PCIE_OPEN_Z1 + D.PCIE_APEX_H * apex_frac,
+    )
+    squared = chassis.cut(
+        box(cx0 - D.PCIE_OPEN_W / 2, D.CASE_REAR - D.PCIE_RIB_D - 0.5, D.PCIE_OPEN_Z1,
+            cx0 + D.PCIE_OPEN_W / 2, D.CASE_REAR + D.WALL + 0.5, D.PCIE_APEX_Z)
+    )
+    add("開孔頂改回矩形 → 尖頂收斂區被挖空（水平懸空回來了）",
+        not inside(squared, apex_probe), "square top")
+    add("現況尖頂收斂區有料（45°，切片器不生支撐）",
+        inside(chassis, apex_probe), "45deg apex")
+
+    # ④ 後牆頂蓋槽
+    slot_bands = D.top_rear_tab_bands()
+    xm = (slot_bands[1][0] + slot_bands[1][1]) / 2
+    y_slot = D.CASE_REAR + D.WALL - (D.TOP_REAR_LIP + D.SLIDE_FIT) / 2
+    z_slot = D.INNER_TOP_Z - D.TOP_T / 2
+    filled_slot = chassis.fuse(
+        box(xm - 5.0, D.CASE_REAR + D.WALL - (D.TOP_REAR_LIP + D.SLIDE_FIT),
+            D.INNER_TOP_Z - D.TOP_T,
+            xm + 5.0, D.CASE_REAR + D.WALL, D.INNER_TOP_Z + D.SLIDE_FIT)
+    )
+    add("後牆頂蓋槽填實 → Top 後舌插不進去",
+        inside(filled_slot, (xm, y_slot, z_slot)), "slot filled")
+    add("現況後牆頂蓋槽開通（−Y 止擋面）",
+        not inside(chassis, (xm, y_slot, z_slot)), "slot open")
+    tab_probe13 = (xm, D.FLOOR_Y0 + D.TOP_FIT_GAP - D.TOP_REAR_LIP / 2, z_slot)
+    add("現況 Top 後舌實心", inside(top, tab_probe13), "rear tab solid")
+
+    # ⑤ 前罩 U 形雙壁夾持
+    y_lap = D.SHROUD_Y0 - D.SHROUD_LAP / 2
+    z_lap = (D.SHROUD_INNER_Z0 + D.SHROUD_INNER_Z1) / 2
+    x_in = D.CASE_LEFT + D.WALL + D.SLIDE_FIT + D.SHROUD_INNER_T / 2
+    inner_cut = box(
+        D.CASE_LEFT + D.WALL, D.SHROUD_Y0 - D.SHROUD_LAP - 0.2, D.SHROUD_INNER_Z0 - 0.2,
+        D.CASE_LEFT + D.WALL + D.SLIDE_FIT + D.SHROUD_INNER_T + 0.2,
+        D.SHROUD_Y0 + 0.2, D.SHROUD_INNER_Z1 + 0.2,
+    )
+    add("前罩內壁刪掉 → 只剩單邊搭接（牆的內面又是光的）",
+        not inside(shroud.cut(inner_cut), (x_in, y_lap, z_lap)), "inner wall gone")
+    add("現況前罩內壁實心（牆被兩片夾住）",
+        inside(shroud, (x_in, y_lap, z_lap)), f"{D.SHROUD_INNER_T} mm")
+
+    # ⑥ 第十四輪：MB_Screw 頭頂十字工具槽
+    zc = D.MB_SCREW_CROSS_DEPTH / 2
+    q = D.MB_SCREW_CROSS_W / 2 + 0.4
+    raw_screw = B.make_mb_screw()
+    cross_fill = B._mb_screw_cross().common(
+        box(-9.0, -9.0, 0.0, 9.0, 9.0, D.MB_SCREW_HEAD_H)
+    )
+    add("十字槽填回 → 槽心探點變實心（起子插不進去）",
+        inside(raw_screw.fuse(cross_fill), (0.0, 0.0, zc)), "cross recess missing")
+    add("現況十字槽是空腔", not inside(raw_screw, (0.0, 0.0, zc)),
+        f"深 {D.MB_SCREW_CROSS_DEPTH} / 臂寬 {D.MB_SCREW_CROSS_W}")
+    # 非 vacuous：圓孔也會讓「槽心是空的」通過，象限角那條才分得出十字
+    round_hole = Part.makeCylinder(D.MB_SCREW_CROSS_L / 2, D.MB_SCREW_CROSS_DEPTH)
+    round_hole.translate(App.Vector(0, 0, -0.001))
+    add("十字換成同徑圓孔 → 象限角變空（象限角探點不是裝飾）",
+        not inside(raw_screw.fuse(cross_fill).cut(round_hole), (q, q, zc)),
+        "round recess is not a cross")
+    add("現況象限角實心（是十字不是圓孔）", inside(raw_screw, (q, q, zc)),
+        f"象限角 ({q:.2f}, {q:.2f})")
+
+    # ⑦ 第十四輪：PCIe 窗框底緣的 45° 引入楔
     fx0, fx1 = D.pcie_frame_x()
-    fz0, fz1 = D.pcie_frame_z()
-    y_boss = D.CASE_REAR - D.PCIE_RIB_D / 2
-    rear_nf = rear.cut(box(fx0 - 1.0, D.CASE_REAR - D.PCIE_RIB_D - 1.0, fz0 - 1.0,
-                           fx1 + 1.0, D.CASE_REAR, fz1 + 1.0))
-    cs_n = sorted(D.pcie_centers())
-    add("窗框不補強 → 底檻外側是空的",
-        not V.pt_inside(rear_nf, (cs_n[0] + cs_n[-1]) / 2, y_boss, D.PCIE_Z0 - 2.0, 0.02),
-        "只補中間三根肋等於沒補框")
-    add("現況 → 底檻／左右柱都補到 6.40",
-        all(V.pt_inside(rear, xx, y_boss, zz, 0.02) for xx, zz in
-            (((cs_n[0] + cs_n[-1]) / 2, D.PCIE_Z0 - 2.0),
-             (fx0 + 1.0, (D.PCIE_Z0 + D.PCIE_Z1) / 2),
-             (fx1 - 1.0, (D.PCIE_Z0 + D.PCIE_Z1) / 2))),
-        f"舌袋背後剩料 {D.WALL + D.PCIE_RIB_D - D.PCIE_TANG_POCKET:.2f}")
+    fz0 = D.pcie_frame_z()[0]
+    y_out = D.CASE_REAR
+    wedge = B.tri_prism_yz(
+        [(y_out, fz0 - D.PCIE_FRAME_LEAD), (y_out, fz0), (y_out - D.PCIE_FRAME_LEAD, fz0)],
+        fx0 - 0.1, fx1 + 0.1,
+    )
 
-    # 33. install_depth 用舊定義（CASE_D + 壓條厚）→ 少報最凸的蘑菇柱
-    old_id = D.CASE_D + D.PCIE_BAR_T
-    add("install_depth 用舊定義 → 比實際少報",
-        old_id < D.install_depth_mm() - 0.01,
-        f"舊 {old_id:.2f} < 實際 {D.install_depth_mm():.2f}（差 {D.install_depth_mm() - old_id:.2f}）")
-    y_min_n = min(V.obb(bar).YMin, V.obb(rear).YMin)
-    add("現況 → install_depth 對得上量出來的外凸",
-        abs(D.install_depth_mm() - (D.CASE_D + (D.CASE_REAR - y_min_n))) < 0.05,
-        f"{D.install_depth_mm():.2f}")
+    cs = D.pcie_centers()
+    ox0 = min(cs) - D.PCIE_OPEN_W / 2
+    ox1 = max(cs) + D.PCIE_OPEN_W / 2
 
-    # 34. 蘑菇柱回到第九輪的 4.0×5.5
-    add("蘑菇柱回到 4.0×5.5 → 頸斷面 22 mm² 太細", 4.0 * 5.5 < 40.0, "22.0 mm²")
-    add("現況 → 頸斷面 >= 40 mm²",
-        D.PCIE_HOOK_NECK_W * D.PCIE_HOOK_NECK_D >= 40.0,
-        f"{D.PCIE_HOOK_NECK_W * D.PCIE_HOOK_NECK_D:.1f} mm²")
+    def band_overhangs(shape):
+        return [
+            bb for a, sl, bb in V.support_overhangs(shape)
+            if bb.XMax > ox0 and bb.XMin < ox1
+            and bb.ZMax > D.FLOOR_T and bb.ZMin < D.PCIE_TIE_Z1
+        ]
 
-    # 35. 第八／九輪文件寫的順序（後牆自 +Z 落下）→ 側板已在位時根本落不下去
-    drop = rear.copy()
-    drop.translate(App.Vector(0, 0, 40.0))
-    swept_drop = drop
-    for i in range(1, 9):
-        mv = rear.copy()
-        mv.translate(App.Vector(0, 0, 40.0 * (8 - i) / 8.0))
-        swept_drop = swept_drop.fuse(mv)
-    hit_drop = max(V.common_vol(swept_drop, side_l), V.common_vol(swept_drop, side_r))
-    add("後牆自 +Z 落下（舊文件的順序）→ 撞側板", hit_drop > MAX,
-        f"{hit_drop:.0f} mm3 —— 定位舌的口袋上方是實牆，落不進去")
-    push = rear.copy()
-    push.translate(App.Vector(0, -(D.REAR_TAB_D + 6.0), 0))
-    swept_push = push
-    for i in range(1, 9):
-        mv = rear.copy()
-        mv.translate(App.Vector(0, -(D.REAR_TAB_D + 6.0) * (8 - i) / 8.0, 0))
-        swept_push = swept_push.fuse(mv)
-    det_l = B.rear_tab_detents(True, 0.05) + B.rear_tab_detents(False, 0.05)
-    sl_nd, sr_nd = side_l, side_r
-    for dd in B.rear_tab_detents(True, 0.05):
-        sl_nd = sl_nd.cut(dd)
-    for dd in B.rear_tab_detents(False, 0.05):
-        sr_nd = sr_nd.cut(dd)
-    hit_push = max(V.common_vol(swept_push, sl_nd), V.common_vol(swept_push, sr_nd),
-                   V.common_vol(swept_push, tray.cut(B.floor_rear_detents(0.05)[0])
-                                .cut(B.floor_rear_detents(0.05)[1])))
-    add("現況 → 後牆自 −Y 推入（使用者指定的順序）路徑淨空", hit_push <= MAX,
-        f"{hit_push:.2f} mm3")
-
-    # 36. detent 必須真的咬到：把母件的凹坑填回去，公件一定要撞
-    for tag, gen, male, female in (
-        ("前罩頂搭接", lambda: B.shroud_lap_detents(True, 0.15), top, sh),
-        ("前罩底搭接", lambda: B.shroud_lap_detents(False, 0.15), tray, sh),
-    ):
-        filled = female
-        for d in gen():
-            filled = filled.fuse(d)
-        v = V.common_vol(filled, male)
-        add(f"{tag} detent 凹坑填回去 → 公件必撞", v > MAX, f"{v:.2f} mm3")
-        add(f"現況 → {tag} 落到定位不干涉", V.common_vol(female, male) <= MAX,
-            f"{V.common_vol(female, male):.2f} mm3")
-    # 底板側緣 bead：把側板的凹槽填回去，bead 一定要撞
-    filled_side = side_l
-    for c in B.floor_detents(True, D.SLIDE_FIT / 2):
-        filled_side = filled_side.fuse(c)
-    v_bead = V.common_vol(filled_side, tray)
-    add("底板 bead 的凹槽填回去 → bead 必撞", v_bead > MAX, f"{v_bead:.2f} mm3")
-    add("現況 → bead 落到定位不干涉", V.common_vol(side_l, tray) <= MAX,
-        f"{V.common_vol(side_l, tray):.2f} mm3")
-    add("底板 bead 的凸出量大於滑配（不是裝飾）",
-        D.FLOOR_DETENT_DEPTH > D.SLIDE_FIT,
-        f"凸 {D.FLOOR_DETENT_DEPTH} − 滑配 {D.SLIDE_FIT} = 過盈 "
-        f"{D.FLOOR_DETENT_DEPTH - D.SLIDE_FIT:.2f}")
-
-    # ══ 第十一輪：使用者「我仍然看不出這機殼要怎麼組裝在一起」量出來的兩個 ══
-    # 40. 後牆的保持力：半球（第十輪）受拉會 cam-out，直角楔不會。
-    #     把半球塞回去 → 「有法線平行 Y 的直角面」這條檢查必須紅。
-    y_sq = B.rear_wedge_y1()
-    sphere_like = Part.makeSphere(D.DETENT_R)
-    sphere_like.translate(App.Vector(D.FLOOR_X0 - 1.0, y_sq, D.REAR_DETENT_Z[1]))
-    sq_faces = 0
-    for f in sphere_like.Faces:
-        u0, u1, v0, v1 = f.ParameterRange
-        n = f.normalAt((u0 + u1) / 2, (v0 + v1) / 2)
-        if abs(n.y) > 0.99 and abs(f.CenterOfMass.y - y_sq) < 0.05:
-            sq_faces += 1
-    add("後牆 detent 換回半球 → 找不到法線平行 Y 的直角面（會 cam-out）",
-        sq_faces == 0, f"半球上這種面有 {sq_faces} 個")
-    want_a = D.DETENT_DEPTH * D.REAR_WEDGE_H * 0.8
-    got_a = 0.0
-    for f in B.rear_tab_detents(True)[0].Faces:
-        u0, u1, v0, v1 = f.ParameterRange
-        n = f.normalAt((u0 + u1) / 2, (v0 + v1) / 2)
-        if abs(n.y) > 0.99 and abs(f.CenterOfMass.y - y_sq) < 0.05:
-            got_a = max(got_a, f.Area)
-    add("現況 → 楔上有直角面", got_a >= want_a, f"{got_a:.2f} >= {want_a:.2f} mm²")
-    # 缺口若改成「開在舌中間的孔」→ 直角面前方那片舌料只剩 0.45，一拉就掰斷。
-    mid_hole_lig = (D.CASE_REAR + D.WALL + D.REAR_TAB_D) - (y_sq + D.SLIDE_FIT / 2)
-    add("缺口改成舌中間的孔 → 前緣只剩不到 2 mm 細肉（現況是整片舌料）",
-        mid_hole_lig < 2.0 and V.pt_inside(
-            rear, D.FLOOR_X0 - D.REAR_TAB_T / 2, y_sq + D.SLIDE_FIT, D.REAR_DETENT_Z[1], 0.02),
-        f"若開孔，孔前只有 {mid_hole_lig:.2f} mm；現況缺口自舌根開 → 前方一路實心")
-    # 把楔從側板上削掉（＝重建第十輪的狀態）→ 後牆往 −Y 走 12 mm 完全沒有東西擋
-    nowedge = {}
-    for isl, k in ((True, "Side_Left_MB"), (False, "Side_Right_MB")):
-        s = S[k]
-        for w in B.rear_tab_detents(isl, 0.05):
-            s = s.cut(w)
-        nowedge[k] = s
-    mv = rear.copy()
-    mv.translate(App.Vector(0, -12.0, 0))
-    v_pull = max(V.common_vol(mv, s) for s in nowedge.values())
-    add("削掉楔（＝第十輪）→ 後牆往 −Y 走 12 mm 不撞側板",
-        v_pull <= MAX, f"{v_pull:.2f} mm3")
-    mv2 = rear.copy()
-    mv2.translate(App.Vector(0, -0.5, 0))
-    v_now = max(V.common_vol(mv2, S[k]) for k in ("Side_Left_MB", "Side_Right_MB"))
-    add("現況 → 後牆往 −Y 只走 0.5 mm 就被楔擋住", v_now > MAX, f"{v_now:.2f} mm3")
-
-    # 41. 碟架的 −Y 止擋：槽的盲端回到第十輪的 TRAY_Y0 − 1.0 → 碟架浮 3 mm
-    old_stop = D.TRAY_Y0 - 1.0
-    float_old = min(D.RACK_BEAM_Y) - D.RACK_BEAM_W / 2 - old_stop
-    add("碟架槽盲端回到 TRAY_Y0 − 1.0 → 碟架往 −Y 浮 3 mm",
-        float_old > 2.0, f"浮 {float_old:.2f} mm")
-    add("現況 → 盲端由側舌後緣導出，浮動＝滑配",
-        abs((min(D.RACK_BEAM_Y) - D.RACK_BEAM_W / 2 - D.RACK_STOP_Y) - D.SLIDE_FIT) < 1e-9,
-        f"RACK_STOP_Y={D.RACK_STOP_Y:.2f}，浮 {D.SLIDE_FIT}")
-    mv3 = rack.copy()
-    mv3.translate(App.Vector(0, -2.0, 0))
-    v_rack = max(V.common_vol(mv3, S[k]) for k in ("Side_Left_MB", "Side_Right_MB"))
-    add("現況 → 碟架往 −Y 走 2 mm 就撞側板（第十輪走 3.0 都不撞）",
-        v_rack > MAX, f"{v_rack:.2f} mm3")
-
-    # 42. 為什麼前十輪抓不到上面兩個：**干涉檢查對它們是瞎的**。
-    #     把楔整組拿掉（＝第十輪的狀態），`no interfere` 照樣綠。
-    add("削掉楔之後 interference 檢查仍然是綠的 → 它問的不是『裝得住嗎』",
-        max(V.common_vol(rear, s) for s in nowedge.values()) <= MAX,
-        "干涉 0.00，要位移 12 mm 才看得出沒東西擋")
-
-    # 37. 死參數（定義了卻沒有任何檢查引用）必須是刪掉的，不是留著
-    zombie = [g for g in ("PCIE_OPEN_GAP", "TRAY_SIDE_GAP", "TOP_SLIDE_STOP",
-                          "TOP_LEDGE_T", "TOP_LEDGE_W") if hasattr(D, g)]
-    add("現況 → 第十輪清掉的死參數沒有復活", not zombie, f"殘留 {zombie}" if zombie else "0 個")
-    add("現況 → 死函式（zone_clear_top_z / pcie_ear_x_span）已刪",
-        not hasattr(D, "zone_clear_top_z") and not hasattr(D, "pcie_ear_x_span"), "0 個")
-
-    # 38. 電源按鈕本體：`PWR_BTN_DEPTH` 兩輪沒有任何檢查引用（硬規則 15）
-    btn = mocks["電源按鈕本體"]
-    worst_btn = max(V.common_vol(btn, s2) for s2 in S.values())
-    add("現況 → 電源按鈕本體 22 深不撞任何印件", worst_btn <= MAX, f"{worst_btn:.2f} mm3")
-    r_nut = D.PWR_BTN_NUT_D / 2
-    y_face = D.CASE_FRONT - D.TRAY_FACE_T
-    btn_bad = box(-100.0 - r_nut, y_face - D.PWR_BTN_DEPTH, 60.0 - r_nut,
-                  -100.0 + r_nut, y_face, 60.0 + r_nut)
-    v_bad = max(V.common_vol(btn_bad, rack), V.common_vol(btn_bad, sh),
-                V.common_vol(btn_bad, dtray))
-    add("按鈕挪到碟架的 X／Z 上 → 撞碟架／前罩", v_bad > MAX, f"{v_bad:.0f} mm3")
-
-    # 39. 碟架頂板與頂蓋底面共面（第八～九輪）→ 頂蓋滑入時要磨過 100 mm
-    add("INNER_TOP_Z 直接取 RACK_TOP_Z1 → 碟架頂與頂蓋底共面",
-        abs(D.RACK_TOP_Z1 - (D.INNER_TOP_Z - D.RACK_TOP_GAP)) < 1e-9 and D.RACK_TOP_GAP > 0,
-        f"補了 {D.RACK_TOP_GAP} 的間隙（沒補的話兩面在 z={D.RACK_TOP_Z1:.2f} 共面）")
-    slab_gap = box(D.HDD_X0 + 5, D.TRAY_Y0 + 5, D.RACK_TOP_Z1 + 0.05,
-                   D.HDD_X1 - 5, D.BAY_SPLIT_Y - 5, D.INNER_TOP_Z - 0.05)
-    worst_gap = max(V.common_vol(slab_gap, s2) for s2 in S.values())
-    add("現況 → 碟架頂板上方那道縫是空的", worst_gap <= MAX, f"{worst_gap:.2f} mm3")
+    add("窗框 45° 引入楔切掉 → PCIe 窗區又冒出需支撐的水平朝下面",
+        len(band_overhangs(chassis.cut(wedge))) > 0, "flat frame underside is back")
+    add("現況 PCIe 窗區一片需支撐朝下面都沒有",
+        len(band_overhangs(chassis)) == 0,
+        f"門檻 {D.SUPPORT_THRESHOLD_ANGLE:g}°（= preset support_threshold_angle）")
 
     App.closeDocument(doc.Name)
-    allok = True
-    for name, cond, note in res:
-        print(("PASS " if cond else "MISS ") + name + " — " + note)
-        allok = allok and cond
-    print(f"NEGTEST {sum(1 for _, c, _ in res if c)}/{len(res)}")
-    print("NEGTEST_OK" if allok else "NEGTEST_FAILED")
-    return 0 if allok else 1
+    all_ok = True
+    for name, condition, note in results:
+        print(("PASS " if condition else "MISS ") + name + " — " + note)
+        all_ok = all_ok and condition
+    print(f"NEGTEST {sum(1 for _, passed, _ in results if passed)}/{len(results)}")
+    print("NEGTEST_OK" if all_ok else "NEGTEST_FAILED")
+    return 0 if all_ok else 1
 
 
 code = 1

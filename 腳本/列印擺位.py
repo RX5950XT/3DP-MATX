@@ -27,6 +27,7 @@ import math
 import os
 import struct
 import sys
+from functools import lru_cache
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 STL_DIR = os.path.join(ROOT, "列印件")
@@ -41,21 +42,83 @@ BED_H = D.A1_H_MAX
 COS45 = math.cos(math.radians(45.0))
 FIRST_LAYER_BAND = 0.2  # 視為「貼床」的 z 帶寬
 SUPPORT_LINE_W = 0.42  # support_line_width（0.16mm Optimal @BBL A1 繼承鏈解析後）
-PRESET = os.path.join(ROOT, "列印設定", "3DP-MATX 機殼件 0.16 支撐.json")
+PRESET_DIR = os.path.join(ROOT, "列印設定")
+
+PRESET_SUPPORT = "3DP-MATX 機殼件 0.16 支撐"
+PRESET_NO_SUPPORT = "3DP-MATX 機殼件 0.16 無支撐"
+PRESET_MB_SCREW = "3DP-MATX 主板螺絲 0.12"
+
+# 唯一列印計畫：支撐狀態由 preset 的 enable_support 導出，不另存一份布林值。
+PRINT_PLAN = {
+    "Chassis_Body": {
+        "preset": PRESET_SUPPORT,
+        "orientation": "Z+ 朝上",
+        "plate_rotation_deg": 0.0,
+    },
+    "Top_MB": {
+        "preset": PRESET_SUPPORT,
+        "orientation": "Z- 朝上",
+        "plate_rotation_deg": 0.0,
+    },
+    "Front_Shroud": {
+        "preset": PRESET_NO_SUPPORT,
+        "orientation": "Y- 朝上",
+        "plate_rotation_deg": 0.0,
+    },
+    "HDD_Rack": {
+        "preset": PRESET_SUPPORT,
+        "orientation": "Z- 朝上",
+        "plate_rotation_deg": 45.0,
+    },
+    "HDD_Tray": {
+        "preset": PRESET_SUPPORT,
+        "orientation": "Z+ 朝上",
+        "plate_rotation_deg": 0.0,
+    },
+    "PCIeBlank": {
+        "preset": PRESET_NO_SUPPORT,
+        "orientation": "Z+ 朝上",
+        "plate_rotation_deg": 0.0,
+    },
+    "PCIeBar": {
+        "preset": PRESET_NO_SUPPORT,
+        "orientation": "Y+ 朝上",
+        "plate_rotation_deg": 0.0,
+    },
+    "MB_Screw": {
+        "preset": PRESET_MB_SCREW,
+        "orientation": "Z+ 朝上",
+        "plate_rotation_deg": 0.0,
+    },
+}
 
 
-def _support_xy() -> float:
-    """普通支撐往件外脹的量。
+@lru_cache(maxsize=None)
+def load_process_preset(name: str) -> dict:
+    """讀一份 repo process preset；名稱只允許 basename，避免路徑跳脫。"""
+    if not name or os.path.basename(name) != name:
+        raise SystemExit(f"非法 preset 名稱：{name!r}")
+    path = os.path.join(PRESET_DIR, name + ".json")
+    if not os.path.isfile(path):
+        raise SystemExit(f"找不到 preset：{path}")
+    with open(path, encoding="utf-8") as f:
+        preset = json.load(f)
+    if not isinstance(preset, dict):
+        raise SystemExit(f"preset 必須是 JSON object：{path}")
+    if preset.get("enable_support") not in ("0", "1"):
+        raise SystemExit(f"preset enable_support 必須是 0/1：{path}")
+    return preset
 
-    = support_object_xy_distance + support_line_width + raft_first_layer_expansion
 
-    ★ 三項**全部從 preset 讀**，不寫死：preset 一改，這裡的餘量跟著變。
-    ★ 第三項是踩過的坑：`raft_first_layer_expansion = -1`（自動）會把**支撐的
-      第一層**往外擴 2.9~4.0 mm，實測讓底板的支撐跑到 X = -0.912 / 256.912。
-      它是 raft 的參數，`support_expansion` 與 `brim_type` 都管不到它。
-    """
-    with open(PRESET, encoding="utf-8") as f:
-        p = json.load(f)
+def support_enabled(preset_name: str) -> bool:
+    return load_process_preset(preset_name)["enable_support"] == "1"
+
+
+def support_xy(preset_name: str) -> float:
+    """普通支撐往件外脹的量；未開支撐的 preset 回傳 0。"""
+    p = load_process_preset(preset_name)
+    if p["enable_support"] == "0":
+        return 0.0
     if p.get("support_type") != "normal(auto)":
         raise SystemExit(
             "preset 的 support_type = %r —— 只有 normal(auto) 的外脹量是這個式子；"
@@ -70,31 +133,6 @@ def _support_xy() -> float:
     return float(p["support_object_xy_distance"]) + SUPPORT_LINE_W + raft
 
 
-SUP_XY = _support_xy()
-
-# 每個 STL 的建議擺法（來源：本腳本的量測；理由見 文件/列印參數與擺位.md）
-RECOMMENDED = {
-    "Bottom_Tray": "Z+ 朝上",
-    "Rear_IO_PCIe": "Z- 朝上",
-    "Side_Left_MB": "X+ 朝上",
-    "Side_Right_MB": "X- 朝上",
-    "Top_MB": "Z- 朝上",
-    "Front_Shroud": "Y- 朝上",
-    "HDD_Rack": "Z- 朝上",
-    "HDD_Tray": "Z+ 朝上",
-    "PCIeBlank": "Z+ 朝上",
-    "PCIeBar": "Y+ 朝上",
-    "MB_Nut": "Z+ 朝上",
-}
-# 懸空幾乎為零、開了支撐反而毀件的（進氣柵塞滿／支撐長進螺紋牙谷）
-NO_SUPPORT = ("Front_Shroud", "PCIeBlank", "PCIeBar", "MB_Nut")
-
-# 擺盤時繞 Z 轉幾度。`CASE_W = 252.68` 在 256 的床上單邊只剩 1.66 mm，
-# 加上支撐更少 —— 細長件轉 45° 可以把餘量從 1 mm 級拉到 10 mm 級。
-# 近正方形的件（底板／頂蓋／前罩）轉了沒用，只能靠 no_brim + 支撐不外脹。
-PLATE_ROT = {k: 0.0 for k in RECOMMENDED}
-PLATE_ROT["Rear_IO_PCIe"] = 45.0   # 254.2 × 23.9 → 185.9 × 185.9
-PLATE_ROT["HDD_Rack"] = 45.0       # 251.2 × 105.1 → 227.5 × 227.5
 MIN_MARGIN = 0.75  # 每邊至少留這麼多；低於這個就是靠運氣
 
 ORIENTS = {
@@ -142,7 +180,7 @@ def volume_cm3(tris) -> float:
     return abs(v) / 1000.0
 
 
-def analyse(tris, fn):
+def analyse(tris, fn, support_margin=0.0):
     """回傳 (bbox, 懸空 mm², 床接觸 mm², 普通支撐後 XY, 樹狀支撐後 XY)。
 
     ★ 「件本身放得下」不等於「加了支撐放得下」。支撐是**印出來的料**，
@@ -189,8 +227,8 @@ def analyse(tris, fn):
             for k in range(2):
                 mn = min(a[k], b[k], c[k])
                 mx = max(a[k], b[k], c[k])
-                slo[k] = min(slo[k], mn - SUP_XY)
-                shi[k] = max(shi[k], mx + SUP_XY)
+                slo[k] = min(slo[k], mn - support_margin)
+                shi[k] = max(shi[k], mx + support_margin)
                 tlo[k] = min(tlo[k], mn - h)  # 分枝 45° 往外斜到床
                 thi[k] = max(thi[k], mx + h)
     return (
@@ -204,16 +242,36 @@ def analyse(tris, fn):
 
 def main(argv) -> int:
     _assert_rotations()
-    if set(RECOMMENDED) != set(D.STL_NAMES):  # 漏件守衛（硬規則 7）
+    if set(PRINT_PLAN) != set(D.STL_NAMES):
         raise SystemExit(
-            "RECOMMENDED 與 STL_NAMES 不一致：%s"
-            % (set(RECOMMENDED) ^ set(D.STL_NAMES),)
+            "PRINT_PLAN 與 STL_NAMES 不一致：%s"
+            % (set(PRINT_PLAN) ^ set(D.STL_NAMES),)
         )
+    expected_fields = {"preset", "orientation", "plate_rotation_deg"}
+    for key, plan in PRINT_PLAN.items():
+        if not isinstance(plan, dict):
+            raise SystemExit(f"PRINT_PLAN[{key}] 必須是 dict")
+        if set(plan) != expected_fields:
+            raise SystemExit(
+                f"PRINT_PLAN[{key}] 欄位錯誤：{set(plan) ^ expected_fields}"
+            )
+        if not isinstance(plan["preset"], str) or not plan["preset"]:
+            raise SystemExit(f"PRINT_PLAN[{key}] preset 必須是非空字串")
+        if plan["orientation"] not in ORIENTS:
+            raise SystemExit(f"PRINT_PLAN[{key}] 姿態不存在：{plan['orientation']}")
+        if not isinstance(plan["plate_rotation_deg"], (int, float)):
+            raise SystemExit(f"PRINT_PLAN[{key}] 盤上旋轉不是數字")
+        load_process_preset(plan["preset"])
     best_only = "--best" in argv
     total = 0.0
     tree_bad = []
     print("A1 床 %.0f × %.0f × %.0f（bed_exclude_area = []）" % (BED, BED, BED_H))
     for key, fname in D.STL_NAMES.items():
+        plan = PRINT_PLAN[key]
+        preset_name = plan["preset"]
+        has_support = support_enabled(preset_name)
+        support_margin = support_xy(preset_name)
+        recommended = plan["orientation"]
         path = os.path.join(STL_DIR, fname)
         if not os.path.isfile(path):
             raise SystemExit(f"缺少 STL：{path}（先跑 _run_build.py）")
@@ -222,44 +280,51 @@ def main(argv) -> int:
         vol = volume_cm3(tris)
         total += vol * qty
         print("=" * 74)
-        print("%s  ×%d  實體 %.1f cm3  tri=%d  支撐：%s"
+        print("%s  ×%d  實體 %.1f cm3  tri=%d  支撐：%s  preset：%s"
               % (fname, qty, vol, len(tris),
-                 "關" if key in NO_SUPPORT else "開"))
+                 "開" if has_support else "關", preset_name))
         for oname, fn in ORIENTS.items():
-            if best_only and oname != RECOMMENDED[key]:
+            if best_only and oname != recommended:
                 continue
-            bbox, over, bed, sup, tree = analyse(tris, fn)
+            bbox, over, bed, sup, tree = analyse(tris, fn, support_margin)
             fits = bbox[0] <= BED and bbox[1] <= BED and bbox[2] <= BED_H
             print("  %s %-8s %7.2f × %7.2f × %7.2f  %s  懸空 %8.1f  床接觸 %8.1f"
-                  % ("★" if oname == RECOMMENDED[key] else " ", oname,
+                  % ("★" if oname == recommended else " ", oname,
                      bbox[0], bbox[1], bbox[2], "OK " if fits else "放不下",
                      over, bed))
             if not fits:
                 raise SystemExit(f"{fname} 的 {oname} 放不進 A1 床")
-            if oname != RECOMMENDED[key]:
+            if oname != recommended:
                 continue
-            rot = PLATE_ROT[key]
+            rot = plan["plate_rotation_deg"]
             if rot:
                 th = math.radians(rot)
                 ct, st = math.cos(th), math.sin(th)
-                base = fn
-                rfn = (lambda p, base=base, ct=ct, st=st: (
-                    base(p)[0] * ct - base(p)[1] * st,
-                    base(p)[0] * st + base(p)[1] * ct,
-                    base(p)[2]))
-                _, _, _, sup, tree = analyse(tris, rfn)
+                def rfn(point, base=fn, cos_theta=ct, sin_theta=st):
+                    x, y, z = base(point)
+                    return (
+                        x * cos_theta - y * sin_theta,
+                        x * sin_theta + y * cos_theta,
+                        z,
+                    )
+
+                _, _, _, sup, tree = analyse(tris, rfn, support_margin)
             over_tree = tree[0] > BED or tree[1] > BED
             margin = (BED - max(sup)) / 2.0
-            print("      擺盤轉 %4.1f°  加支撐後佔床 %7.2f × %7.2f  餘量 %5.2f/邊  "
-                  "（樹狀45° 會是 %7.2f × %7.2f %s）"
-                  % (rot, sup[0], sup[1], margin, tree[0], tree[1],
-                     "超出" if over_tree else "OK"))
+            if has_support:
+                print("      擺盤轉 %4.1f°  加支撐後佔床 %7.2f × %7.2f  餘量 %5.2f/邊  "
+                      "（樹狀45° 會是 %7.2f × %7.2f %s）"
+                      % (rot, sup[0], sup[1], margin, tree[0], tree[1],
+                         "超出" if over_tree else "OK"))
+            else:
+                print("      擺盤轉 %4.1f°  無支撐佔床   %7.2f × %7.2f  餘量 %5.2f/邊"
+                      % (rot, sup[0], sup[1], margin))
             if margin < MIN_MARGIN:
                 raise SystemExit(
-                    f"{fname} 轉 {rot}° 加支撐後 {sup[0]:.2f} × {sup[1]:.2f}，"
+                    f"{fname} 轉 {rot}° 佔床 {sup[0]:.2f} × {sup[1]:.2f}，"
                     f"餘量只有 {margin:.2f}/邊 < {MIN_MARGIN}"
                 )
-            if over_tree and key not in NO_SUPPORT:
+            if over_tree and has_support:
                 tree_bad.append((fname, tree))
     print("=" * 74)
     print("FILAMENT_VOLUME %.1f cm3（含份數）→ PETG @1.28 ≈ %.0f g"

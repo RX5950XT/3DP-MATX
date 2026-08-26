@@ -4,12 +4,13 @@
 FreeCADCmd 沒有 GUI，無法用 get_view 截圖；本檔用純 numpy/PIL 光柵化補上
 「每次改完要看一眼」這一步。
 
-    python 腳本/渲染預覽.py            # 四視角總成
-    python 腳本/渲染預覽.py 主板托盤    # 單件
+    python 腳本/渲染預覽.py                    # 四視角總成
+    python 腳本/渲染預覽.py 機殼本體_主板段一體式  # 單件
 """
 
 from __future__ import annotations
 
+import glob
 import os
 import struct
 import sys
@@ -36,32 +37,66 @@ OUT_DIR = os.path.join(ROOT, "規格")
 sys.path.insert(0, os.path.join(ROOT, "腳本"))
 import 參數 as D  # noqa: E402
 
-# (檔名, RGB, 擺放)。顏色對應 build_case.PREVIEW_COLORS。
-# 擺放 None＝STL 已是總成座標；否則列出各實例的平移量（STL 是列印姿態的單顆）。
+# (檔名, RGB, 實例變換)。變換為 (tx,ty,tz) 或 (tx,ty,tz,rx,ry,rz)。
+# None＝STL 已是總成座標；角度單位為 degree、依 X/Y/Z 套用。
 PARTS = (
-    ("底板_主板托盤.stl", (48, 110, 210), None),
-    ("後牆_IO與PCIe.stl", (222, 176, 40), None),
-    ("左側板_主板段.stl", (140, 148, 158), None),
-    ("右側板_主板段.stl", (140, 148, 158), None),
+    ("機殼本體_主板段一體式.stl", (48, 110, 210), None),
+    ("頂蓋_主板段.stl", (198, 202, 208), None),
     ("前罩_含進氣柵.stl", (36, 138, 88), None),
     ("碟架_四層導軌.stl", (90, 100, 120), None),
-    # 同一個 STL 印四份 → 預覽按層節距平移（與 build_case.make_hdd_tray_placed 同源）
-    ("碟托盤.stl", (60, 170, 200), [(0.0, 0.0, D.tray_z0(lv)) for lv in range(D.HDD_LEVELS)]),
-    ("頂蓋_主板段.stl", (198, 202, 208), None),
-    # 與 build_case.make_pcie_blank_parked() 同一平移
-    ("PCIe槽蓋.stl", (217, 217, 224), [(D.CASE_RIGHT + 20.0, D.CASE_REAR, 0.0)]),
-    ("PCIe壓條_外置.stl", (230, 90, 50), None),
-    # 單顆 STL × 九孔。預覽只平移不轉相位（螺紋相位在這個尺度上看不出來）
     (
-        "主板壓帽.stl",
+        "碟托盤.stl",
+        (60, 170, 200),
+        [(0.0, 0.0, D.tray_z0(level)) for level in range(D.HDD_LEVELS)],
+    ),
+    (
+        "PCIe槽蓋.stl",
+        (217, 217, 224),
+        [
+            (
+                cx - D.PCIE_BRACKET_W / 2,
+                D.PCIE_BRACKET_Y1,
+                D.PCIE_TANG_Z0,
+                90.0,
+                0.0,
+                0.0,
+            )
+            for cx in D.pcie_centers()
+        ],
+    ),
+    ("PCIe壓條_外置.stl", (230, 90, 50), None),
+    (
+        "主板螺絲_印製.stl",
         (242, 140, 26),
-        [(hx, hy, D.BOARD_TOP_Z) for hx, hy in D.HOLES_MM.values()],
+        [
+            (hx, hy, D.BOARD_TOP_Z + D.MB_SCREW_HEAD_H, 180.0, 0.0, 0.0)
+            for hx, hy in D.HOLES_MM.values()
+        ]
+        # ★ 第十三輪：同一顆螺絲也鎖 PCIeBar（軸沿 +Y ⇒ 繞 X 轉 270°）。
+        #   只畫主板那九顆的話，總成圖會少掉兩顆真的存在的緊固件。
+        + [
+            (
+                hx,
+                D.pcie_bar_mount_y() - D.PCIE_BAR_SEAT_T - D.MB_SCREW_HEAD_H,
+                D.PCIE_LOCK_Z,
+                270.0,
+                0.0,
+                0.0,
+            )
+            for hx in D.pcie_lock_x()
+        ],
     ),
 )
 
-_missing = set(D.STL_NAMES.values()) - {p[0] for p in PARTS}
-if _missing:  # 新增列印件卻沒進預覽 → 直接爆，不要默默少畫一件
-    raise SystemExit(f"PARTS 漏了列印件：{sorted(_missing)}")
+_part_files = [part[0] for part in PARTS]
+_expected_files = set(D.STL_NAMES.values())
+if set(_part_files) != _expected_files or len(_part_files) != len(_expected_files):
+    raise SystemExit(
+        "PARTS 與 manifest 不一致："
+        f"missing={sorted(_expected_files - set(_part_files))} "
+        f"extra={sorted(set(_part_files) - _expected_files)} "
+        f"duplicates={len(_part_files) - len(set(_part_files))}"
+    )
 
 VIEWS = (
     ("iso", (0.72, -0.60, 0.35), (0, 0, 1), "ISO"),
@@ -82,6 +117,26 @@ def load_stl(path):
         raise ValueError(f"STL 長度與三角數不符: {path}")
     arr = np.frombuffer(data, dtype=np.uint8, count=n * 50, offset=84).reshape(n, 50)
     return arr[:, 12:48].copy().view("<f4").reshape(n, 3, 3).astype(np.float64)
+
+
+def transform_tris(tris, transform):
+    """對列印姿態 STL 套組裝用剛體變換。"""
+    values = tuple(float(v) for v in transform)
+    if len(values) not in (3, 6):
+        raise ValueError(f"實例變換必須有 3 或 6 個值：{transform}")
+    out = tris.copy()
+    if len(values) == 6:
+        tx, ty, tz, rx, ry, rz = values
+        for degrees, matrix in (
+            (rx, lambda c, s: np.array(((1, 0, 0), (0, c, -s), (0, s, c)))),
+            (ry, lambda c, s: np.array(((c, 0, s), (0, 1, 0), (-s, 0, c)))),
+            (rz, lambda c, s: np.array(((c, -s, 0), (s, c, 0), (0, 0, 1)))),
+        ):
+            radians = np.deg2rad(degrees)
+            out = out @ matrix(np.cos(radians), np.sin(radians)).T
+    else:
+        tx, ty, tz = values
+    return out + np.array((tx, ty, tz), dtype=float)
 
 
 def render(tris, cols, eye, up, size=(1100, 820), bg=(250, 250, 252), title="",
@@ -155,16 +210,21 @@ def collect(names=None):
         if not os.path.isfile(path):
             raise FileNotFoundError(path)
         t = load_stl(path)
-        for off in places or [(0.0, 0.0, 0.0)]:
-            inst = t + np.asarray(off, float)
+        transforms = places or [(0.0, 0.0, 0.0)]
+        for transform in transforms:
+            inst = transform_tris(t, transform)
             tri.append(inst)
             col.append(np.tile(np.asarray(c, float), (len(inst), 1)))
-        print(f"{fn}: {len(t)} tri x{len(places or [1])}")
+        print(f"{fn}: {len(t)} tri x{len(transforms)}")
     return np.concatenate(tri), np.concatenate(col)
 
 
 def main(argv):
     os.makedirs(OUT_DIR, exist_ok=True)
+    for removed in D.REMOVED_STL:
+        stem = os.path.splitext(removed)[0]
+        for stale in glob.glob(os.path.join(OUT_DIR, f"{stem}視圖_*.png")):
+            os.remove(stale)
     names = argv[1:] or None
     tris, cols = collect(names)
     tag = "_".join(names) if names else "總成"

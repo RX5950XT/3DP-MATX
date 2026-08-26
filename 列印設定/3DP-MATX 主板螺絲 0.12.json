@@ -5,14 +5,14 @@
     "from": "User",
     "inherits": "0.12mm Fine @BBL A1",
     "layer_height": "0.12",
-    "name": "3DP-MATX 螺紋壓帽 0.12",
+    "name": "3DP-MATX 主板螺絲 0.12",
     "print_extruder_id": [
         "1"
     ],
     "print_extruder_variant": [
         "Direct Drive Standard"
     ],
-    "print_settings_id": "3DP-MATX 螺紋壓帽 0.12",
+    "print_settings_id": "3DP-MATX 主板螺絲 0.12",
     "skirt_loops": "0",
     "sparse_infill_density": "100%",
     "version": "02.07.00.08",

@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import glob
 import os
 import sys
 
@@ -26,26 +27,33 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "腳本"))
 
 import 參數 as D  # noqa: E402
-from 渲染預覽 import PARTS, STL_DIR, cjk_font, load_stl, render  # noqa: E402
+from 渲染預覽 import (  # noqa: E402
+    PARTS,
+    STL_DIR,
+    cjk_font,
+    load_stl,
+    render,
+    transform_tris,
+)
 
 OUT_DIR = os.path.join(ROOT, "規格")
 STL_OF = D.STL_NAMES  # key → 檔名
 COLOR_OF = {fn: c for fn, c, _ in PARTS}
 PLACES_OF = {fn: p for fn, _, p in PARTS}
 
-# 爆炸圖／逐步圖的拉開距離（沿裝入方向的反向）。ASSEMBLY_STEPS 只給 Y，
-# 底板是基準件沒有方向 → 給它 −Z 讓它落在最下面。
+# 爆炸圖／逐步圖的拉開距離（沿裝入方向的反向）。Chassis 是基準件，
+# `insert_vec()` 保持零位移；爆炸圖另由 SPREAD 向下拉開，逐步圖維持原點。
 EXPLODE = 1.6  # 爆炸圖把 ASSEMBLY_STEPS 的行程再乘這個倍率
 STEP_FRAC = 0.42  # 逐步圖裡「還沒裝到底」的那一件停在行程的幾成
 
 
 def part_tris(key, offset=(0.0, 0.0, 0.0), color=None):
-    """讀某個列印件的 STL（含多實例擺放），套上平移。"""
+    """讀某個列印件的 STL（含數量實例與剛體變換），再套爆炸平移。"""
     fn = STL_OF[key]
-    t = load_stl(os.path.join(STL_DIR, fn))
+    source = load_stl(os.path.join(STL_DIR, fn))
     out = []
-    for pl in PLACES_OF[fn] or [(0.0, 0.0, 0.0)]:
-        out.append(t + np.asarray(pl, float) + np.asarray(offset, float))
+    for transform in PLACES_OF[fn] or [(0.0, 0.0, 0.0)]:
+        out.append(transform_tris(source, transform) + np.asarray(offset, float))
     tri = np.concatenate(out)
     return tri, np.tile(np.asarray(color or COLOR_OF[fn], float), (len(tri), 1))
 
@@ -53,12 +61,12 @@ def part_tris(key, offset=(0.0, 0.0, 0.0), color=None):
 def insert_vec(key):
     """裝入方向（單位向量）與行程長度。唯一來源＝ASSEMBLY_STEPS。"""
     for k, dy in D.ASSEMBLY_STEPS:
-        if k == key:
-            if abs(dy) < 1e-9:
-                return np.array([0.0, 0.0, -1.0]), 60.0  # 基準件：往下擺開
-            return np.array([0.0, 1.0 if dy > 0 else -1.0, 0.0]), abs(dy)
-    # 不在互鎖鏈上的（PCIe 壓條在機殼外、槽蓋、壓帽）
-    return np.array([0.0, -1.0, 0.0]), 40.0
+        if k != key:
+            continue
+        if abs(dy) < 1e-9:
+            return np.zeros(3), 0.0
+        return np.array([0.0, 1.0 if dy > 0 else -1.0, 0.0]), abs(dy)
+    raise KeyError(f"{key} 不在 ASSEMBLY_STEPS")
 
 
 def clip_box(tris, cols, lo, hi):
@@ -72,7 +80,9 @@ def clip_box(tris, cols, lo, hi):
     tb0, tb1 = tris.min(axis=1), tris.max(axis=1)
     m = np.all((tb1 >= lo - 1e-9) & (tb0 <= hi + 1e-9), axis=1)  # 先用 bbox 粗篩
     tris, cols = tris[m], cols[m]
-    planes = [(a, +1.0, lo[a]) for a in range(3)] + [(a, -1.0, -hi[a]) for a in range(3)]
+    planes = [(a, +1.0, lo[a]) for a in range(3)] + [
+        (a, -1.0, -hi[a]) for a in range(3)
+    ]
     ot, oc = [], []
     for t, c in zip(tris, cols):
         poly = [t[0], t[1], t[2]]
@@ -96,8 +106,15 @@ def clip_box(tris, cols, lo, hi):
     return np.array(ot), np.array(oc)
 
 
-def scene(pairs, eye=(0.72, -0.60, 0.35), up=(0, 0, 1), title="", size=(1400, 1000),
-          section=None, colors=None):
+def scene(
+    pairs,
+    eye=(0.72, -0.60, 0.35),
+    up=(0, 0, 1),
+    title="",
+    size=(1400, 1000),
+    section=None,
+    colors=None,
+):
     """pairs = [(key, offset)]；section=(lo, hi) 把畫面裁進一個世界座標盒子。"""
     tri, col = [], []
     for i, (key, off) in enumerate(pairs):
@@ -109,9 +126,14 @@ def scene(pairs, eye=(0.72, -0.60, 0.35), up=(0, 0, 1), title="", size=(1400, 10
     if section is not None:
         tri, col = clip_box(tri, col, *section)
         lo, hi = np.asarray(section[0], float), np.asarray(section[1], float)
-        focus = np.array([[x, y, z] for x in lo[[0]].tolist() + hi[[0]].tolist()
-                          for y in lo[[1]].tolist() + hi[[1]].tolist()
-                          for z in lo[[2]].tolist() + hi[[2]].tolist()])
+        focus = np.array(
+            [
+                [x, y, z]
+                for x in lo[[0]].tolist() + hi[[0]].tolist()
+                for y in lo[[1]].tolist() + hi[[1]].tolist()
+                for z in lo[[2]].tolist() + hi[[2]].tolist()
+            ]
+        )
     return render(tri, col, eye, up, size=size, title=title, focus=focus)
 
 
@@ -122,111 +144,200 @@ def save(img, name):
 
 
 # ── ① 爆炸圖 ─────────────────────────────────────────────────────────
-SPREAD = {  # 純為了看清楚的橫向位移（**不是**裝入方向；裝入方向見 ASSEMBLY_STEPS）
-    "Side_Left_MB": (-150.0, 0.0, 0.0),
-    "Side_Right_MB": (150.0, 0.0, 0.0),
+SPREAD = {  # 純為了看清楚，不是裝入方向
+    "Chassis_Body": (0.0, 0.0, -70.0),
     "Top_MB": (0.0, 0.0, 130.0),
-    "Bottom_Tray": (0.0, 0.0, -70.0),
 }
+if not set(SPREAD) <= set(D.STL_NAMES):
+    raise SystemExit(f"SPREAD 含退役件：{sorted(set(SPREAD) - set(D.STL_NAMES))}")
 
 
 def exploded():
     pairs = []
     for i, (key, _) in enumerate(D.ASSEMBLY_STEPS):
-        v, run = insert_vec(key)
-        off = -v * min(run, 130.0) * EXPLODE * (0.30 + 0.16 * i)
-        pairs.append((key, off + np.asarray(SPREAD.get(key, (0.0, 0.0, 0.0)), float)))
-    # 不在互鎖鏈上的：壓條在機殼外（往 −Y 壓上去再往下落）、壓帽鎖在主板柱上
-    pairs.append(("PCIeBar", np.array([0.0, -190.0, 0.0])))
-    pairs.append(("MB_Nut", np.array([0.0, 0.0, -70.0])))
-    save(scene(pairs, size=(1600, 1100),
-               title="爆炸圖：沿各件真正的裝入方向拉開（唯一來源 ASSEMBLY_STEPS）；"
-                     "側板／頂蓋另外橫向拉開純為了看清楚"),
-         "爆炸圖")
+        vector, run = insert_vec(key)
+        offset = -vector * min(run, 130.0) * EXPLODE * (0.30 + 0.16 * i)
+        pairs.append(
+            (key, offset + np.asarray(SPREAD.get(key, (0.0, 0.0, 0.0)), float))
+        )
+    # 不在滑入鏈上的固定件另外拉開：Bar 外抽、主板螺絲上提、槽蓋列為備件。
+    pairs.extend(
+        (
+            ("PCIeBar", np.array((0.0, -190.0, 0.0))),
+            ("MB_Screw", np.array((0.0, 0.0, 100.0))),
+            ("PCIeBlank", np.array((0.0, -130.0, 0.0))),
+        )
+    )
+    save(
+        scene(
+            pairs,
+            size=(1600, 1100),
+            title="爆炸圖：Chassis 是單一基準件；其餘沿 ASSEMBLY_STEPS 的反向拉開；"
+            "PCIeBar／主板螺絲另列固定流程",
+        ),
+        "爆炸圖",
+    )
 
 
 # ── ② 逐步組裝 ───────────────────────────────────────────────────────
 def steps():
-    for i, (key, _) in enumerate(D.ASSEMBLY_STEPS):
+    for i, (key, dy) in enumerate(D.ASSEMBLY_STEPS):
         pairs = [(k, (0.0, 0.0, 0.0)) for k, _ in D.ASSEMBLY_STEPS[:i]]
-        v, run = insert_vec(key)
-        pairs.append((key, -v * min(run, 130.0) * STEP_FRAC))
+        if abs(dy) < 1e-9:
+            pairs.append((key, (0.0, 0.0, 0.0)))
+            action = "一體式基準件"
+        else:
+            v, run = insert_vec(key)
+            pairs.append((key, -v * min(run, 130.0) * STEP_FRAC))
+            action = f"沿 {'+Y' if v[1] > 0 else '-Y'} 裝入"
         save(
-            scene(pairs, title=f"第 {i + 1} 步 / {len(D.ASSEMBLY_STEPS)}：{key} 沿 "
-                               f"{'+Y' if v[1] > 0 else ('-Y' if v[1] < 0 else '-Z')} 裝入"),
+            scene(
+                pairs,
+                title=f"第 {i + 1} 步 / {len(D.ASSEMBLY_STEPS)}：{key} {action}",
+            ),
             f"步驟{i + 1}_{key}",
         )
 
 
 # ── ③ 卡榫剖面特寫 ───────────────────────────────────────────────────
 def closeups():
-    """每一張都是**剖面盒**：盒子的近端面就是剖切面，鏡頭推到只剩十幾 mm 寬。"""
-    xl, xr = D.CASE_LEFT, D.CASE_RIGHT
-    y_sq = D.CASE_REAR + D.WALL + D.REAR_WEDGE_RAMP + D.REAR_WEDGE_BACK
-    zd = D.REAR_DETENT_Z[1]
-    yb = D.FLOOR_Y0 + D.FLOOR_DETENT_RUN  # 底板 bead 的 y
-    # ★ 剖面盒的切面是**開口**（STL 是殼不是實體），正對著切面看等於看空氣：
-    #   垂直牆面在正投影下是一條線。所以「俯視剖」一律用斜視角，讓牆面露出來。
-    BACK, RIGHT = (0, -1, 0.001), (1, 0, 0.001)
-    IN_L = (0.86, -0.34, 0.38)  # 自機殼內往左牆看（左牆的口袋朝 +X 開）
-    DOWN_IN = (0.52, -0.22, 0.82)  # 自內上方斜看（俯視剖用）
-    OUT_L_F = (-0.58, 0.26, 0.77)  # 自左外前上方斜看（前罩搭接用）
-    IN_R_F = (-0.72, 0.48, 0.50)  # 自機殼內往右牆看、且偏 +Y（看得到朝前的止擋面）
+    """第十二輪接合特寫；每張只留兩件並以 AABB 真裁切。"""
+    down_in = (0.52, -0.22, 0.82)
+    in_left = (0.86, -0.34, 0.38)
+    top_x = D.TOP_DETENT_X[0]
+    lock_x = D.pcie_lock_x()[0]
+    mb_x, mb_y = D.HOLES_MM["B"]
     shots = (
-        # (檔名, 兩件, 視線, up, 剖面盒 lo, 剖面盒 hi, 標題)
-        ("A_底板與側板", ("Bottom_Tray", "Side_Left_MB"), BACK, (0, 0, 1),
-         (xl - 1.5, yb - 24, -1.0), (xl + 8.0, yb - 1.0, 9.0),
-         f"A 底板↔側板（後視剖）：側舌伸出 {D.FLOOR_LIP:.2f} 插進 "
-         f"{D.FLOOR_LIP + D.SLIDE_FIT:.2f} 深的槽；槽下方 {D.FLOOR_LEDGE_T:.2f} "
-         f"承載唇托著、槽上方 {D.WALL - D.FLOOR_LIP - D.SLIDE_FIT:.2f} 牆料壓著"),
-        ("B_底板側緣bead", ("Bottom_Tray", "Side_Left_MB"), DOWN_IN, (0, 0, 1),
-         (xl - 1.5, yb - 10, 0.0), (xl + 8.0, yb + 10, D.FLOOR_T - 0.2),
-         f"B 底板側緣 bead（俯視剖 z={D.FLOOR_T / 2:.1f}）：凸 "
-         f"{D.FLOOR_DETENT_DEPTH:.2f}，扣掉滑配 {D.SLIDE_FIT:.2f} 的過盈是 "
-         f"{D.FLOOR_DETENT_DEPTH - D.SLIDE_FIT:.2f} → 側板滑到最後 "
-         f"{D.floor_detent_run_mm():.0f} mm 才卡住"),
-        ("C_後牆單向楔", ("Rear_IO_PCIe", "Side_Left_MB"), IN_L, (0, 0, 1),
-         (xl - 0.5, D.CASE_REAR - 7.0, zd - 7.0), (xl + 5.0, D.CASE_REAR + 11.0, zd + 7.0),
-         f"C 後牆↔側板 單向楔（橘＝後牆定位舌，藍＝側板；後牆退開 6 mm 好看清楚）："
-         f"舌的缺口自根部往前開，楔的斜坡讓它推得進去、直角面 y={y_sq:.2f} 讓它拉不出來",
-         (0.0, -6.0, 0.0)),
-        ("D_底板與後牆", ("Bottom_Tray", "Rear_IO_PCIe"), RIGHT, (0, 0, 1),
-         (D.REAR_FLOOR_DETENT_X[1] - 0.4, D.CASE_REAR - 1.0, -1.0),
-         (D.REAR_FLOOR_DETENT_X[1] + 6.0, D.CASE_REAR + 6.0, 6.0),
-         f"D 底板↔後牆（右視剖）：底板後舌插進後牆低位槽，槽下方 "
-         f"{D.FLOOR_LEDGE_T:.2f} 承載唇；半球 detent 刻意保持可 cam-out ＝拆卸路徑"),
-        ("E_頂蓋與側板", ("Top_MB", "Side_Left_MB"), BACK, (0, 0, 1),
-         (xl - 1.5, 100.0, D.INNER_TOP_Z - 8.0), (xl + 8.0, 118.0, D.OUTER_TOP_Z + 1.0),
-         f"E 頂蓋↔側板（後視剖）：側舌咬合 {D.TOP_LIP:.2f}（第九輪只有 0.40），"
-         f"槽上方仍有 {D.WALL - D.TOP_LIP - D.SLIDE_FIT:.2f} 牆料 → 抬不起來"),
-        ("F_碟架止擋", ("HDD_Rack", "Side_Right_MB"), IN_R_F, (0, 0, 1),
-         (xr - 8.0, D.RACK_STOP_Y - 6.0, D.RACK_RAIL_Z0 - 4.0),
-         (xr + 1.0, D.RACK_STOP_Y + 22.0, D.RACK_RAIL_Z1 + 4.0),
-         f"F 碟架↔側板（右視剖）：槽的盲端 y={D.RACK_STOP_Y:.2f} ＝推到底的止擋面"
-         f"（第十輪開到 179.34，碟架往 −Y 浮 3.00 mm）"),
-        ("G_前罩搭接", ("Front_Shroud", "Side_Left_MB"), OUT_L_F, (0, 0, 1),
-         (xl - 2.5, D.BAY_SPLIT_Y - D.SHROUD_LAP - 6.0, D.SHROUD_DETENT_Z[1] - 5.0),
-         (xl + 6.0, D.BAY_SPLIT_Y + 6.0, D.SHROUD_DETENT_Z[1] + 5.0),
-         f"G 前罩↔側板（俯視剖 z={D.SHROUD_DETENT_Z[1]:.0f}）：外表面減薄 "
-         f"{D.SHROUD_LAP_T + D.SLIDE_FIT:.2f}、前罩殼 {D.SHROUD_LAP_T:.2f} 填回去 → 齊平；"
-         f"半球 detent（唯一徒手可拆的蓋，刻意可 cam-out）"),
+        (
+            "A_Top側槽",
+            ("Chassis_Body", "Top_MB"),
+            down_in,
+            (0, 0, 1),
+            (D.CASE_LEFT - 1.5, 100.0, D.INNER_TOP_Z - 8.0),
+            (D.CASE_LEFT + 8.0, 118.0, D.OUTER_TOP_Z + 1.0),
+            f"A Top與Chassis：側舌咬合 {D.TOP_LIP:.2f} mm；槽背仍留 "
+            f"{D.WALL - D.TOP_LIP - D.SLIDE_FIT:.2f} mm 牆料",
+        ),
+        (
+            "B_Top後鉤detent",
+            ("Chassis_Body", "Top_MB"),
+            down_in,
+            (0, 0, 1),
+            (top_x - 5.0, D.FLOOR_Y0 - 1.0, D.OUTER_TOP_Z - 5.0),
+            (top_x + 5.0, D.FLOOR_Y0 + D.TOP_HOOK_D + 3.0, D.OUTER_TOP_Z + 1.0),
+            f"B Top 後鉤 detent：R{D.TOP_DETENT_R:.2f}、凸出 {D.TOP_DETENT_DEPTH:.2f}；"
+            "只在最後 6 mm 越過，拆 Front 後可沿 +Y cam-out",
+        ),
+        (
+            "C_Rack底部格柵",
+            ("HDD_Rack", "HDD_Tray"),
+            (0.52, -0.22, -0.82),
+            (0, 0, 1),
+            (
+                D.RACK_BASE_SPINE_X - 18.0,
+                min(D.RACK_BASE_BEAM_Y) - D.RACK_BASE_BEAM_W / 2.0 - 2.0,
+                D.RACK_Z0 - 1.0,
+            ),
+            (
+                D.RACK_BASE_SPINE_X + 18.0,
+                max(D.RACK_BASE_BEAM_Y) + D.RACK_BASE_BEAM_W / 2.0 + 2.0,
+                D.HDD_Z0 + 13.0,
+            ),
+            f"C Rack 格柵（托盤示意上提 8 mm）：三條 {D.RACK_BASE_BEAM_W:.0f} mm "
+            f"橫樑由中央 {D.RACK_BASE_SPINE_W:.0f} mm 縱樑連接；"
+            f"實際落位間隙 {D.SLIDE_FIT:.2f} mm",
+        ),
+        (
+            "D_Rack盲端止擋",
+            ("Chassis_Body", "HDD_Rack"),
+            (-0.72, 0.48, 0.50),
+            (0, 0, 1),
+            (D.CASE_RIGHT - 8.0, D.RACK_STOP_Y - 6.0, D.RACK_RAIL_Z0 - 4.0),
+            (D.CASE_RIGHT + 1.0, D.RACK_STOP_Y + 22.0, D.RACK_RAIL_Z1 + 4.0),
+            f"D Rack與Chassis：側槽盲端 y={D.RACK_STOP_Y:.2f} 限制 −Y；"
+            f"最後只保留 {D.SLIDE_FIT:.2f} mm play",
+        ),
+        (
+            "E_Front導入與detent",
+            ("Front_Shroud", "Chassis_Body"),
+            (-0.86, -0.34, 0.38),
+            (0, 0, 1),
+            (
+                D.CASE_LEFT - 2.5,
+                D.SHROUD_Y0 - D.SHROUD_LAP - 2.0,
+                D.SHROUD_DETENT_Z[1] - 6.0,
+            ),
+            (D.CASE_LEFT + 6.0, D.BAY_SPLIT_Y + 4.0, D.SHROUD_DETENT_Z[1] + 6.0),
+            f"E Front與Chassis（Front 示意沿 +Y 拉開 10 mm）：搭接 "
+            f"{D.SHROUD_LAP:.0f} mm、後緣 {D.SHROUD_LEAD_IN:.0f} mm×45° 導入；"
+            "實際落位由半球 detent 保持可拆",
+        ),
+        (
+            "F_主板盲牙螺絲",
+            ("Chassis_Body", "MB_Screw"),
+            in_left,
+            (0, 0, 1),
+            (mb_x - 7.0, mb_y - 7.0, D.FLOOR_T - 1.0),
+            (mb_x + 0.1, mb_y + 7.0, D.MB_SCREW_HEAD_TOP_Z + 2.0),
+            f"F 主板固定：Ø{D.SHOULDER_OD:.0f}×{D.SHOULDER_H:.2f} 支撐肩、"
+            f"{D.MB_SOCKET_DEPTH:.2f} mm 盲內牙、8 mm AF 印製螺絲",
+        ),
+        (
+            "G_PCIe雙螺絲座",
+            ("Chassis_Body", "PCIeBar"),
+            (0.18, -0.96, 0.22),
+            (0, 0, 1),
+            (
+                lock_x - 10.0,
+                D.pcie_bar_mount_y() - D.PCIE_BAR_T - 3.0,
+                D.PCIE_LOCK_Z - 10.0,
+            ),
+            (lock_x + 10.0, D.CASE_REAR + 3.0, D.PCIE_LOCK_Z + 10.0),
+            f"G PCIe：5 mm Bar 的 Ø{D.PCIE_BAR_HOLE_D:.2f} 通孔 + "
+            f"Ø{D.PCIE_BAR_CBORE_D:.2f} 沉頭凹，對準繫樑上的 "
+            f"{D.MB_SOCKET_DEPTH:.2f} mm 印製盲內牙；2× MB_Screw 鎖固",
+        ),
+        (
+            "H_PCIe尖頂與承托肩",
+            ("Chassis_Body", "HDD_Rack"),
+            (-0.72, 0.48, 0.50),
+            (0, 0, 1),
+            (
+                D.CASE_RIGHT - 14.0,
+                D.RACK_LEDGE_Y0 - 2.0,
+                D.RACK_LEDGE_Z0 - D.RACK_LEDGE_GUSSET - 4.0,
+            ),
+            (D.CASE_RIGHT + 1.0, D.RACK_LEDGE_Y0 + 22.0, D.RACK_RAIL_Z1 + 4.0),
+            f"H 碟架承托肩：牆內面伸出 {D.RACK_LEDGE_D:.0f} mm 承重面 + 45° 斜撐；"
+            f"肩頂 {D.RACK_LEDGE_Z1:.2f} 比橫樑底低 {D.SLIDE_FIT:.2f}（載重才坐實）",
+        ),
     )
     font = cjk_font(16)
-    pair_col = ((214, 124, 44), (66, 112, 178))  # 兩件永遠一橘一藍，一眼分得出誰是誰
-    for shot in shots:
-        name, parts, eye, up, lo, hi, title = shot[:7]
-        off0 = shot[7] if len(shot) > 7 else (0.0, 0.0, 0.0)
-        img = scene([(parts[0], off0), (parts[1], (0.0, 0.0, 0.0))], eye=eye, up=up,
-                    size=(1300, 820), section=(lo, hi), colors=pair_col)
-        d = ImageDraw.Draw(img)
+    pair_colors = ((214, 124, 44), (66, 112, 178))
+    for name, parts, eye, up, lo, hi, title in shots:
+        first_offset = (
+            (0.0, 10.0, 0.0) if name == "E_Front導入與detent" else (0.0, 0.0, 0.0)
+        )
+        second_offset = (0.0, 0.0, 8.0) if name == "C_Rack底部格柵" else (0.0, 0.0, 0.0)
+        image = scene(
+            [(parts[0], first_offset), (parts[1], second_offset)],
+            eye=eye,
+            up=up,
+            size=(1300, 820),
+            section=(lo, hi),
+            colors=pair_colors,
+        )
+        draw = ImageDraw.Draw(image)
         for dx, dy in ((-1, -1), (1, -1), (-1, 1), (1, 1)):
-            d.text((14 + dx, 12 + dy), title, fill=(250, 250, 252), font=font)
-        d.text((14, 12), title, fill=(18, 18, 22), font=font)
-        save(img, name)
+            draw.text((14 + dx, 12 + dy), title, fill=(250, 250, 252), font=font)
+        draw.text((14, 12), title, fill=(18, 18, 22), font=font)
+        save(image, name)
 
 
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
+    for stale in glob.glob(os.path.join(OUT_DIR, "組裝_*.png")):
+        os.remove(stale)
     exploded()
     steps()
     closeups()

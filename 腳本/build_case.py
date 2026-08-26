@@ -57,8 +57,8 @@ def thread_rib(r_minor, depth, pitch, height, z0=0.0, grow=0.0):
     ★ 不用 makeHelix + MakePipeShell：實測那條路徑會**漂移**——三圈掉 0.35 mm，
       比螺帽間隙還大，而且外牙(r=1.15)與內牙(r=0.95)漂移量不同 → 螺帽在任何相位都咬死。
     """
-    hb = D.MB_STUD_ROOT_W * pitch / 2 + grow
-    ht = D.MB_STUD_CREST_W * pitch / 2 + grow
+    hb = D.MB_THREAD_ROOT_W * pitch / 2 + grow
+    ht = D.MB_THREAD_CREST_W * pitch / 2 + grow
     n = max(2, int(round(height / pitch * THREAD_SEG)))
     wires = []
     for k in range(n + 1):
@@ -74,64 +74,95 @@ def thread_rib(r_minor, depth, pitch, height, z0=0.0, grow=0.0):
     return Part.makeLoft(wires, True, True)
 
 
-def make_mb_stud():
-    """主板柱細軸：芯柱（往下埋入粗肩 2 mm）+ 螺旋肋。局部 z=0 對應粗肩頂面。"""
-    r = D.MB_STUD_MINOR / 2
-    core = Part.makeCylinder(r, D.MB_STUD_LEN + 2.0)
-    core.translate(App.Vector(0, 0, -2.0))  # 埋入粗肩，避免只有面接觸
-    rib = thread_rib(r, D.MB_STUD_DEPTH, D.MB_STUD_PITCH, D.MB_STUD_LEN - 0.8)
-    return core.fuse(rib)
+def _hex_prism(across_flats, height):
+    """外六角柱；平面朝床即可穩定列印。工具槽見 make_mb_screw。"""
+    radius = across_flats / math.sqrt(3.0)
+    pts = [
+        App.Vector(radius * math.cos(math.radians(30 + 60 * i)),
+                   radius * math.sin(math.radians(30 + 60 * i)), 0.0)
+        for i in range(6)
+    ]
+    return Part.Face(Part.makePolygon(pts + [pts[0]])).extrude(App.Vector(0, 0, height))
 
 
-def make_mb_nut():
-    """
-    印製壓帽：內牙由「同一條外牙放大 MB_NUT_GAP」挖出 → 兩者一定咬得合。
-    外周開指握溝（手緊；印製牙的扭力上限就是手指）。局部 z=0 = 螺帽底面。
-    """
-    ro = D.MB_NUT_OD / 2
-    g = D.MB_NUT_GAP
-    h = D.MB_NUT_H
-    body = Part.makeCylinder(ro, h)
-    bore = Part.makeCylinder(D.MB_STUD_MINOR / 2 + g, h + 6.0)
-    bore.translate(App.Vector(0, 0, -3.0))
-    cut = thread_rib(
-        D.MB_STUD_MINOR / 2 - g,
-        D.MB_STUD_DEPTH + 2 * g,
-        D.MB_STUD_PITCH,
-        h + 3 * D.MB_STUD_PITCH,
-        z0=-D.MB_STUD_PITCH,
+def make_mb_screw_thread():
+    """穿過 PCB 並在盲孔旋合 5 mm 的外牙；肋根埋入芯柱 0.1 mm。"""
+    r = D.MB_THREAD_MINOR / 2
+    length = D.MB_SCREW_THREAD_LEN
+    core = Part.makeCylinder(r, length)
+    rib = thread_rib(r - 0.1, D.MB_THREAD_DEPTH + 0.1, D.MB_THREAD_PITCH, length)
+    clip = Part.makeCylinder(D.MB_THREAD_MAJOR / 2 + 0.02, length)
+    return core.fuse(rib.common(clip))
+
+
+def make_mb_socket_cutter():
+    """盲內牙切除體；沿用同一條螺旋並放大 MB_THREAD_GAP。"""
+    g = D.MB_THREAD_GAP
+    length = D.MB_SOCKET_DEPTH
+    bore = Part.makeCylinder(D.MB_THREAD_MINOR / 2 + g, length)
+    rib = thread_rib(
+        D.MB_THREAD_MINOR / 2 - g,
+        D.MB_THREAD_DEPTH + 2 * g,
+        D.MB_THREAD_PITCH,
+        length,
         grow=g,
     )
-    nut = body.cut(bore).cut(cut)
-    for i in range(D.MB_NUT_FLUTES):
-        a = 2 * math.pi * i / D.MB_NUT_FLUTES
-        f = Part.makeCylinder(D.MB_NUT_FLUTE_R, h + 2.0)
-        f.translate(App.Vector(ro * math.cos(a), ro * math.sin(a), -1.0))
-        nut = nut.cut(f)
-    return nut
+    clip = Part.makeCylinder(D.MB_THREAD_MAJOR / 2 + g + 0.02, length)
+    return bore.fuse(rib.common(clip))
 
 
-def place_mb_nut(nut, x, y, z_bottom):
+def _mb_screw_cross():
+    """頭頂十字工具槽的切除體（自貼床面 z=0 往上 CROSS_DEPTH）。"""
+    w, ln, dp = D.MB_SCREW_CROSS_W, D.MB_SCREW_CROSS_L, D.MB_SCREW_CROSS_DEPTH
+    return box(-ln / 2, -w / 2, -0.5, ln / 2, w / 2, dp).fuse(
+        box(-w / 2, -ln / 2, -0.5, w / 2, ln / 2, dp)
+    )
+
+
+def make_mb_screw():
+    """頭面朝床、牙軸朝 +Z 的 8 mm AF 專用主板螺絲（頭頂含十字工具槽）。"""
+    head = _hex_prism(D.MB_SCREW_HEAD_AF, D.MB_SCREW_HEAD_H).cut(_mb_screw_cross())
+    neck = Part.makeCylinder(D.MB_THREAD_MINOR / 2, 0.7)
+    neck.translate(App.Vector(0, 0, D.MB_SCREW_HEAD_H - 0.5))
+    shaft = make_mb_screw_thread()
+    shaft.translate(App.Vector(0, 0, D.MB_SCREW_HEAD_H))
+    return head.fuse(neck).fuse(shaft)
+
+
+def place_mb_screw(screw, x, y, seat_z=None):
     """
-    把壓帽旋到工作位。螺紋是螺旋：軸向移動 dz 必須配對應的旋轉
-    α = 360·dz/pitch，否則牙撞牙（verify 就是用這件事證明牙是真的）。
+    把列印姿態的螺絲翻轉到工作位。
+    `seat_z` 是**被夾件的頂面**（螺絲頭的坐面），預設 PCB 上表面；
+    第十三輪的 PCIeBar 傳耳的頂面 —— 夾持厚同為 `PCB_T`，同一顆螺絲通用。
     """
-    s = nut.copy()
-    dz = z_bottom - D.SHOULDER_TOP_Z
-    s.rotate(App.Vector(0, 0, 0), App.Vector(0, 0, 1), 360.0 * dz / D.MB_STUD_PITCH)
-    s.translate(App.Vector(x, y, z_bottom))
+    if seat_z is None:
+        seat_z = D.BOARD_TOP_Z
+    s = screw.copy()
+    s.rotate(App.Vector(0, 0, 0), App.Vector(1, 0, 0), 180)
+    s.translate(App.Vector(x, y, seat_z + D.MB_SCREW_HEAD_H))
+    return s
+
+
+def place_mb_socket_cutter(cutter, x, y, top_z=None):
+    """
+    盲孔自**承接面**向 −Z 切入；與安裝螺絲使用相同相位。
+    `top_z` 預設是主板支撐肩頂；第十三輪的 PCIeBar 鎖點傳繫樑頂面 —— 兩者的
+    夾持厚都是 `PCB_T`（壓條耳厚就是照著取的），所以相位公式完全共用。
+    """
+    if top_z is None:
+        top_z = D.SHOULDER_TOP_Z
+    s = cutter.copy()
+    s.rotate(App.Vector(0, 0, 0), App.Vector(1, 0, 0), 180)
+    s.rotate(
+        App.Vector(0, 0, 0),
+        App.Vector(0, 0, 1),
+        -360.0 * D.PCB_T / D.MB_THREAD_PITCH,
+    )
+    s.translate(App.Vector(x, y, top_z))
     return s
 
 
 # ── 通用鑽孔／凸座 ───────────────────────────────────────────────────
-def bore_x(x_from, x_to, y, z, dia):
-    lo, hi = min(x_from, x_to), max(x_from, x_to)
-    c = Part.makeCylinder(dia / 2, hi - lo)
-    c.rotate(App.Vector(0, 0, 0), App.Vector(0, 1, 0), 90)
-    c.translate(App.Vector(lo, y, z))
-    return c
-
-
 def bore_y(y_from, y_to, x, z, dia):
     lo, hi = min(y_from, y_to), max(y_from, y_to)
     c = Part.makeCylinder(dia / 2, hi - lo)
@@ -163,57 +194,71 @@ def rounded_cut_xz(x0, y0, z0, x1, y1, z1, r):
     return fuse_all(parts)
 
 
-# ── PCIe 壓條 keyhole（唯一來源：後牆 fuse 這些，壓條 cut 對應讓位，verify 量它們）──
-def hook_neck(hx):
-    y = D.CASE_REAR
-    hw = D.PCIE_HOOK_NECK_W / 2
-    return box(hx - hw, y - D.PCIE_HOOK_NECK_D, D.PCIE_HOOK_Z0,
-               hx + hw, y + 1.0, D.PCIE_HOOK_Z0 + D.PCIE_HOOK_H)
+def tri_prism_xy(points, z0, z1):
+    wire = Part.makePolygon([App.Vector(x, y, z0) for x, y in points] + [App.Vector(*points[0], z0)])
+    return Part.Face(wire).extrude(App.Vector(0, 0, z1 - z0))
 
 
-def hook_head(hx):
-    y = D.CASE_REAR - D.PCIE_HOOK_NECK_D
-    hw = D.PCIE_HOOK_HEAD_W / 2
-    return box(hx - hw, y - D.PCIE_HOOK_HEAD_D, D.PCIE_HOOK_Z0,
-               hx + hw, y + D.PCIE_HOOK_FUSE, D.PCIE_HOOK_Z0 + D.PCIE_HOOK_H)
+def tri_prism_yz(points, x0, x1):
+    wire = Part.makePolygon([App.Vector(x0, y, z) for y, z in points] + [App.Vector(x0, *points[0])])
+    return Part.Face(wire).extrude(App.Vector(x1 - x0, 0, 0))
 
 
-def _hook_detent_centres(hx):
-    """兩片翼上的 detent 球心（球心內移 R−DEPTH → 只凸出 DETENT_DEPTH）。"""
-    y_face = D.CASE_REAR - D.PCIE_HOOK_NECK_D + D.PCIE_HOOK_FUSE  # 翼朝牆的那一面
-    yc = y_face - (D.DETENT_R - D.DETENT_DEPTH)
-    zc = D.PCIE_HOOK_Z0 + D.PCIE_HOOK_H / 2
-    dx = (D.PCIE_HOOK_NECK_W + D.PCIE_HOOK_HEAD_W) / 4
-    return [(hx + sx * dx, yc, zc) for sx in (-1, 1)]
+def tri_prism_xz(points, y0, y1):
+    """XZ 平面三角形沿 Y 擠出（PCIe 45° 尖頂、碟架承托肩的 45° 斜撐）。"""
+    wire = Part.makePolygon(
+        [App.Vector(x, y0, z) for x, z in points]
+        + [App.Vector(points[0][0], y0, points[0][1])]
+    )
+    return Part.Face(wire).extrude(App.Vector(0, y1 - y0, 0))
 
 
-def hook_detents(hx, grow=0.0):
+# ── PCIe 外側螺絲座／頂蓋 detent ─────────────────────────────────────
+def place_pcie_lock_socket(cutter, hx):
+    """
+    壓條鎖點盲牙：軸沿 +Y、開口在窗框補強的外表面（不長凸台，Chassis 的 Y 一分不加）。
+    變換序列與主板盲牙完全相同（翻 180° + 依夾持厚補相位），最後把 −Z 軸整體轉到
+    +Y —— 牙的手性因此與 `MB_Screw` 一致，同一顆螺絲兩處通用。
+    """
+    s = cutter.copy()
+    s.rotate(App.Vector(0, 0, 0), App.Vector(1, 0, 0), 180)
+    s.rotate(
+        App.Vector(0, 0, 0),
+        App.Vector(0, 0, 1),
+        -360.0 * D.PCIE_BAR_SEAT_T / D.MB_THREAD_PITCH,
+    )
+    s.rotate(App.Vector(0, 0, 0), App.Vector(1, 0, 0), 90)
+    s.translate(App.Vector(hx, D.pcie_bar_mount_y(), D.PCIE_LOCK_Z))
+    return s
+
+
+def place_pcie_lock_screw(screw, hx):
+    """壓條螺絲的工作位：頭沉在壓條的沉頭凹裡，牙往 +Y 旋進盲內牙。"""
+    s = screw.copy()
+    s.rotate(App.Vector(0, 0, 0), App.Vector(1, 0, 0), 180)
+    s.rotate(App.Vector(0, 0, 0), App.Vector(1, 0, 0), 90)
+    s.translate(
+        App.Vector(
+            hx,
+            D.pcie_bar_mount_y() - D.PCIE_BAR_SEAT_T - D.MB_SCREW_HEAD_H,
+            D.PCIE_LOCK_Z,
+        )
+    )
+    return s
+
+
+def top_detents(grow=0.0):
+    """後鉤前端的兩顆 detent；頂蓋滑到最後才由其後肩越過。"""
+    r = D.TOP_DETENT_R + grow
+    y_face = D.FLOOR_Y0 + D.TOP_HOOK_D
+    yc = y_face - (D.TOP_DETENT_R - D.TOP_DETENT_DEPTH)
+    zc = D.OUTER_TOP_Z - D.TOP_HOOK_T / 2
     out = []
-    for cx, cy, cz in _hook_detent_centres(hx):
-        b = Part.makeSphere(D.DETENT_R + grow)
-        b.translate(App.Vector(cx, cy, cz))
-        out.append(b)
+    for cx in D.TOP_DETENT_X:
+        s = Part.makeSphere(r)
+        s.translate(App.Vector(cx, yc, zc))
+        out.append(s)
     return out
-
-
-def pcie_hook_sites():
-    return [(hx, hook_detents(hx)) for hx in D.pcie_hook_x()]
-
-
-def pcie_bar_slot(hx):
-    """
-    壓條上的 keyhole 讓位：**上窄下寬**。
-    抬起 PCIE_BAR_DROP 時頭自寬口穿過，落下後頭被窄段兩側各 2.2 mm 的料扣住。
-    窄段頂面 = 頸頂面（零間隙）→ 那就是壓條落到底的承靠面，落差自己收斂。
-    """
-    f = D.PCIE_BAR_FIT
-    zk, hn, d = D.PCIE_HOOK_Z0, D.PCIE_HOOK_H, D.PCIE_BAR_DROP
-    y0, y1 = D.CASE_REAR - D.PCIE_BAR_T - 1.0, D.CASE_REAR + 1.0
-    nw = D.PCIE_HOOK_NECK_W / 2 + f
-    hw = D.PCIE_HOOK_HEAD_W / 2 + f
-    narrow = box(hx - nw, y0, zk - d - 1.0, hx + nw, y1, zk + hn)
-    wide = box(hx - hw, y0, zk - d - 1.0, hx + hw, y1, zk - 0.2)
-    return narrow.fuse(wide)
 
 
 def shroud_detents(is_left, grow=0.0):
@@ -242,124 +287,6 @@ def shroud_floor_stud_bands():
     y_lap0 = D.SHROUD_Y0 - D.SHROUD_LAP
     r = D.SHOULDER_OD / 2 + D.SLIDE_FIT
     return sorted((hx - r, hx + r) for hx, hy in D.HOLES_MM.values() if hy + r > y_lap0)
-
-
-def floor_edge_x(is_left):
-    """
-    底板本體側緣的 X（**內縮 SLIDE_FIT**）與舌尖的 X。
-    ★ 第十輪：第九輪的底板本體剛好等於內腔寬 247.88，兩側與牆內面**完全共面**
-      （distToShape 0.0000）—— 250 mm 的跨距上批次收縮差就有 0.25–0.50 mm，
-      零間隙的滑配是裝不上的（硬規則 19 + FDM 跨距收縮那條）。
-    """
-    if is_left:
-        edge = D.FLOOR_X0 + D.SLIDE_FIT
-        return edge, edge - D.FLOOR_LIP
-    edge = D.FLOOR_X1 - D.SLIDE_FIT
-    return edge, edge + D.FLOOR_LIP
-
-
-def floor_detents(is_left, grow=0.0):
-    """
-    底板側緣的縱向 bead（軸沿 Z，只存在於承載唇那 FLOOR_LEDGE_T 的高度帶）。
-    唯一來源：底板 fuse 它、側板 cut 它加大 grow 的凹槽、verify 量它、掃描時扣掉它。
-    """
-    out = []
-    for cx, cy in D.floor_detent_sites(is_left):
-        c = Part.makeCylinder(D.FLOOR_DETENT_R + grow, D.FLOOR_LEDGE_T)
-        c.translate(App.Vector(cx, cy, 0.0))
-        out.append(c)
-    return out
-
-
-def floor_rear_detents(grow=0.0):
-    """
-    底板後緣舌 ↔ 後牆低位槽 的 detent（第十輪新增；使用者：底板與後板之間缺卡榫）。
-    公件是底板舌**上表面**的半球，母件是後牆槽頂面的凹坑（那上面整片都是牆料）。
-    """
-    r = D.FLOOR_REAR_DETENT_R
-    zc = D.FLOOR_T - (r - D.DETENT_DEPTH)
-    yc = D.FLOOR_Y0 - D.FLOOR_LIP / 2
-    out = []
-    for cx in D.REAR_FLOOR_DETENT_X:
-        s = Part.makeSphere(r + grow)
-        s.translate(App.Vector(cx, yc, zc))
-        out.append(s)
-    return out
-
-
-def rear_tab_detents(is_left, grow=0.0):
-    """
-    後牆定位舌 ↔ 側板口袋 的**單向卡榫**。公件（楔）長在側板的口袋底上，
-    母件是後牆定位舌上的貫穿孔。回傳的是**公件實體**，母孔／掃描讓位都由它導出。
-
-    ★ 第十輪把公母對調（球長在 2.4 的牆上、孔開在 1.2 的舌上）。理由仍然成立。
-    ★ 第十一輪把**半球換成不對稱楔**。真相表量出來：後牆往 −Y 拉，>12 mm 都沒有
-      任何幾何擋住 —— 半球是唯一的阻力，而半球受拉會自己爬出來。
-      純滑動接合的公母進出走同一道邊，所以不對稱只能做在公件上：
-
-          −Y ←—— 斜坡 ——→ 峰 →| 直角面
-          （舌自 −Y 推來，前緣爬上斜坡）  （拉不回去）
-
-      楔沿 Z 只有 REAR_WEDGE_H，孔比它高 → Z 方向不靠楔定位（那是槽的事）。
-    """
-    xi = D.FLOOR_X0 if is_left else D.FLOOR_X1
-    sgn = -1 if is_left else +1
-    # 口袋底在 xi + sgn*(REAR_TAB_T + SLIDE_FIT)；楔自口袋底往內凸 DETENT_DEPTH，
-    # 根部再往牆料裡埋 1.0（硬規則 1：只有面接觸的 fuse 不會合併）。
-    x_floor = xi + sgn * (D.REAR_TAB_T + D.SLIDE_FIT)
-    x_tip = x_floor - sgn * (D.DETENT_DEPTH + grow)  # 峰頂（往機殼內凸）
-    x_root = x_floor + sgn * 1.0  # 埋進牆體
-    # 斜坡起點＝側板的後端面（楔不能懸空在側板之外），直角面在它前方 ramp+back。
-    y_ramp = rear_wedge_y0() - grow
-    y_pk0 = y_ramp + D.REAR_WEDGE_RAMP  # 平台後緣＝斜坡頂
-    y_sq = rear_wedge_y1() + grow  # 直角面（＝擋住 −Y 拉出的那一面）
-    out = []
-    for dz in D.REAR_DETENT_Z:
-        z0 = dz - D.REAR_WEDGE_H / 2 - grow
-        z1 = dz + D.REAR_WEDGE_H / 2 + grow
-        # 側視輪廓（Y–X 平面）：斜坡 → 平台 → 直角面 → 埋進牆裡的根部
-        pts = [(y_ramp, x_floor), (y_pk0, x_tip), (y_sq, x_tip), (y_sq, x_root),
-               (y_ramp, x_root)]
-        poly = Part.makePolygon(
-            [App.Vector(x, y, z0) for y, x in pts] + [App.Vector(x_floor, y_ramp, z0)]
-        )
-        w = Part.Face(poly).extrude(App.Vector(0, 0, z1 - z0))
-        # 根部埋 1.0 會超過槽背後剩下的 0.90 → 裁到機殼外表面，外表面必須保持是平的。
-        # 公件、母缺口、掃描讓位看到的是同一顆楔（裁在同一個函式裡）。
-        out.append(w.common(box(D.CASE_LEFT, y_ramp - 1.0, z0 - 1.0,
-                                D.CASE_RIGHT, y_sq + 1.0, z1 + 1.0)))
-    return out
-
-
-def rear_wedge_y0():
-    """楔的斜坡起點＝側板後端面。"""
-    return D.CASE_REAR + D.WALL
-
-
-def rear_wedge_y1():
-    """楔的直角面 y。缺口前緣、驗證探點、負向測試全部指到這裡（硬規則 9）。"""
-    return rear_wedge_y0() + D.REAR_WEDGE_RAMP + D.REAR_WEDGE_BACK
-
-
-def rear_tab_notches(is_left, grow=0.0):
-    """後牆定位舌上的母缺口：**自舌根往前開**，前緣就在楔的直角面前方 SLIDE_FIT/2。
-
-    開缺口不開孔的理由見 參數.REAR_WEDGE_*：直角面推的是缺口前緣，
-    那道邊後面必須是整片舌料（一路連到舌尖），不能只有 0.45 mm 的細肉。
-    """
-    xi = D.FLOOR_X0 if is_left else D.FLOOR_X1
-    sgn = -1 if is_left else +1
-    xa, xb = sorted((xi - sgn * 2.0, xi + sgn * (D.REAR_TAB_T + D.SLIDE_FIT + 2.0)))
-    y_front = rear_wedge_y1() + D.SLIDE_FIT / 2 + grow
-    out = []
-    for dz in D.REAR_DETENT_Z:
-        out.append(
-            box(xa, D.CASE_REAR + D.WALL - 0.6 - grow,
-                dz - D.REAR_WEDGE_H / 2 - D.SLIDE_FIT - grow,
-                xb, y_front,
-                dz + D.REAR_WEDGE_H / 2 + D.SLIDE_FIT + grow)
-        )
-    return out
 
 
 def side_lap_keep_bands():
@@ -428,71 +355,38 @@ def shroud_lap_detents(is_top, grow=0.0):
     return out
 
 
-# ── 底板（＝主板托盤）───────────────────────────────────────────────
-def make_bottom_tray():
-    """
-    底板＝主板托盤。第八輪螺母座**整組刪掉**（改全滑槽），下裙跟著消失。
-
-    ★ 底板與牆的關係**是反過來的**：不是牆插進底板，是**底板自 +Y 滑進牆**。
-      理由和第七輪螺母座只能放地板以下是同一條：主板佔滿內腔（左 3.54／右 0.50／
-      後 1.00），而板底 6.35 淨空（§2.4.2）把 z∈[2.4, 8.75] 也封死 ——
-      任何從底板往上長的定位唇，右側和後側都會直接戳進主板。
-      所以底板三面各伸出一片**舌**，插進左右側板與後牆內面的低位槽裡。
-      那個高度只有地板，沒有主板。
-
-    ★ 第九輪：舌從「整片 2.4 的板邊」改成「上半片 FLOOR_LIP_T」。
-      第八輪的槽開到 z=−0.1，槽的**下方一點料都沒有**（探針 0.00 mm³）——
-      那是 L 形搭邊，地板只是擱在地上、被上面 1.2 的牆料蓋住而已。
-      使用者問「底板跟左右板之間真的有滑蓋設計嗎」，問得對：那時候沒有。
-      現在舌在 z∈[1.2, 2.4]，牆在 z∈[0, 1.2] 保留整厚 → 舌被上下夾住，是真的槽。
-    """
-    xl, xlt = floor_edge_x(True)  # 左側緣、左舌尖
-    xr, xrt = floor_edge_x(False)
-    x0, x1 = xl, xr
-    y0, y1 = D.FLOOR_Y0, D.FLOOR_Y1
-    body = box(x0, y0, 0.0, x1, y1, D.FLOOR_T)
-    # 三面上半舌（左／右／後）。角落自然相接：左右舌的 y 一路延到後舌的外緣。
-    # ★ 第十輪：本體兩側已內縮 SLIDE_FIT（見 floor_edge_x），後緣則**不縮**——
-    #   後牆是自 −Y 推上來對接的，那是個止擋面不是滑配面，留間隙反而定不了位。
-    zt0 = D.FLOOR_T - D.FLOOR_LIP_T
-    ly0 = y0 - D.FLOOR_LIP
-    body = body.fuse(box(xlt, ly0, zt0, x0 + 1.0, y1, D.FLOOR_T))
-    body = body.fuse(box(x1 - 1.0, ly0, zt0, xrt, y1, D.FLOOR_T))
-    body = body.fuse(box(xlt, ly0, zt0, xrt, y0 + 1.0, D.FLOOR_T))
-    # 側緣 bead（底板↔側板的保持力；側板的槽自後端掃過來，只有最後一段有過盈）
-    for is_left in (True, False):
-        for b in floor_detents(is_left):
-            body = body.fuse(b)
-    # 前緣半搭接：前罩的地板舌壓在這片減薄帶上（第八輪前罩底下**完全沒有地板**，
-    # 機殼前段 53.76 mm 是開的）。減薄只在內腔寬度內，不動兩側的舌。
-    body = body.cut(
-        box(x0, y1 - D.SHROUD_LAP, D.FLOOR_T - D.SHROUD_FLOOR_LAP_T, x1, y1 + 0.1, D.FLOOR_T + 0.1)
+# ── 一體式 Chassis 的地板 ─────────────────────────────────────────────
+def make_chassis_floor():
+    """地板反向埋入左右牆與後牆；保留九根 Ø8 支撐肩，不建立任何板面上方凸柱。"""
+    o = D.CHASSIS_OVERLAP
+    body = box(
+        D.FLOOR_X0 - o,
+        D.FLOOR_Y0 - o,
+        0.0,
+        D.FLOOR_X1 + o,
+        D.FLOOR_Y1,
+        D.FLOOR_T,
     )
-    # 落在搭接帶裡的主板柱（L／M 兩孔 y=227.33）：那兩處保留整厚地板當柱腳，
-    # 前罩的地板舌在同樣的 X 帶上挖讓位槽滑過去。
+    # 前緣半搭接：前罩地板舌壓在此減薄帶上；左右牆根保持整厚。
+    body = body.cut(
+        box(
+            D.FLOOR_X0,
+            D.FLOOR_Y1 - D.SHROUD_LAP,
+            D.FLOOR_T - D.SHROUD_FLOOR_LAP_T,
+            D.FLOOR_X1,
+            D.FLOOR_Y1 + 0.1,
+            D.FLOOR_T + 0.1,
+        )
+    )
+    # L／M 兩孔落在搭接帶；保留整厚柱腳，前罩挖同源讓位槽。
     for bx0, bx1 in shroud_floor_stud_bands():
-        body = body.fuse(box(bx0, y1 - D.SHROUD_LAP, 0.0, bx1, y1, D.FLOOR_T))
-    # 九根粗肩（自 z=0 長起 → 與地板真實體積重疊，避免只有面接觸變成獨立 Solid）
+        body = body.fuse(
+            box(bx0, D.FLOOR_Y1 - D.SHROUD_LAP, 0.0,
+                bx1, D.FLOOR_Y1, D.FLOOR_T)
+        )
     for x, y in D.HOLES_MM.values():
         body = body.fuse(cyl(D.SHOULDER_OD / 2, D.SHOULDER_TOP_Z, x, y, 0.0))
-    body = body.removeSplitter()
-
-    # 細軸最後才 fuse，而且**不再 removeSplitter**：
-    # removeSplitter 對螺紋的 loft 面會把形狀弄成 isValid()==False（實測）。
-    stud = make_mb_stud()
-    for x, y in D.HOLES_MM.values():
-        st = stud.copy()
-        st.translate(App.Vector(x, y, D.SHOULDER_TOP_Z))
-        body = body.fuse(st)
-    # ★ 半球 detent 一定要**排在 removeSplitter 之後**才 fuse：
-    #   實測「先 fuse 半球 → removeSplitter → 再 fuse 螺紋 loft」會直接得到 Null shape。
-    #   球面被 removeSplitter 併過之後，再跟 spline 面做布林就會炸。
-    #   （圓柱 bead 沒有這個問題，所以它仍留在前面。）
-    for s in shroud_lap_detents(False):  # 前罩底搭接（前罩地板舌上有對應凹坑）
-        body = body.fuse(s)
-    for s in floor_rear_detents():  # 後緣舌上（後牆槽頂有對應凹坑）
-        body = body.fuse(s)
-    return body
+    return body.removeSplitter()
 
 
 # ── 後牆 ─────────────────────────────────────────────────────────────
@@ -536,21 +430,51 @@ def make_rear_panel():
     fx0, fx1 = D.pcie_frame_x()
     fz0, fz1 = D.pcie_frame_z()
     panel = panel.fuse(box(fx0, y_outer - D.PCIE_RIB_D, fz0, fx1, y_outer + 0.5, fz1))
+    # ★ 第十四輪：窗框底緣的 45° 引入楔。原本 fz0 那一面是 89.4 × 4.0 的水平懸空，
+    #   正在三根肋的下方 —— 切片器要從床長支撐上來並焊在窗框外面（實測 359 mm²）。
+    #   斜面自牆面 fz0 − PCIE_FRAME_LEAD 升到窗框底外緣，Y 不多凸一分。
+    panel = panel.fuse(
+        tri_prism_yz(
+            [
+                (y_outer, fz0 - D.PCIE_FRAME_LEAD),
+                (y_outer, fz0),
+                (y_outer - D.PCIE_FRAME_LEAD, fz0),
+            ],
+            fx0,
+            fx1,
+        )
+    )
     panel = panel.removeSplitter()
 
     # 機殼只需要兩個切除（本體貫穿開孔、內面舌袋），其餘都是想像出來的。
     # 開孔頂 = 擋板頂 + PCIE_LIFT：卡要離開連接器必須整片抬 4.50。
+    # ★ 第十三輪：開孔頂加 45° 尖頂。矩形段只到 PCIE_OPEN_Z1（＝擋板抬到頂的
+    #   頂緣位置，全寬區一點都沒少），其上以 45° 收斂到 PCIE_APEX_Z。
+    #   這一刀讓四個開孔的頂**不再是水平懸空**，切片器不生支撐 → 拆支撐時
+    #   不會再有橫向力去掰那三根 1.42 mm 的肋（使用者實印回報的病灶）。
     centers = D.pcie_centers()
     tang_w = D.PCIE_TANG_W + 2 * D.PCIE_TANG_GAP
+    y_cut0, y_cut1 = y_outer - D.PCIE_RIB_D - 0.5, y_inner + 0.5  # 要切穿補強層
     for cx in centers:
         panel = panel.cut(
             box(
                 cx - D.PCIE_OPEN_W / 2,
-                y_outer - D.PCIE_RIB_D - 0.5,  # 要切穿補強層
+                y_cut0,
                 D.PCIE_Z0,
                 cx + D.PCIE_OPEN_W / 2,
-                y_inner + 0.5,
-                D.PCIE_Z1 + D.PCIE_LIFT,
+                y_cut1,
+                D.PCIE_OPEN_Z1,
+            )
+        )
+        panel = panel.cut(
+            tri_prism_xz(
+                [
+                    (cx - D.PCIE_OPEN_W / 2, D.PCIE_OPEN_Z1),
+                    (cx + D.PCIE_OPEN_W / 2, D.PCIE_OPEN_Z1),
+                    (cx, D.PCIE_APEX_Z),
+                ],
+                y_cut0,
+                y_cut1,
             )
         )
         panel = panel.cut(
@@ -597,20 +521,33 @@ def make_rear_panel():
         )
     )
 
-    # ★ PCIe 壓條的兩顆**蘑菇柱**（keyhole 公件），長在後牆外表面、開孔頂之上。
-    #   壓條先整片往 +Y 壓上去（頭穿過壓條上的寬口），再往下落 PCIE_BAR_DROP，
-    #   頭就被窄槽兩側各 2.2 mm 的料扣住。全程不必沿 X 走 → 肋一根都不用切。
-    for hx, wing in pcie_hook_sites():
-        panel = panel.fuse(hook_neck(hx))
-        panel = panel.fuse(hook_head(hx))
-        # 頭的兩片翼（各 2.5 寬）可以往 −Y 彈 → detent 就長在翼上，
-        # 壓條落到定位時卡進它外表面的凹坑（半球受面內剪力，不是層間拉力）。
-        for b in wing:
-            panel = panel.fuse(b)
+    # ★ 第十三輪：壓條的兩個鎖點改成軸沿 −Y 的**印製盲內牙**（取代 Ø2.8 盲 pilot
+    #   + #6-32 自攻），鑽在繫樑上；盲牙在 make_chassis_body 最後一併切
+    #   （spline 不能再 removeSplitter）。這裡不長任何凸台 —— Chassis 的 Y 只剩
+    #   0.96 mm/邊 的 A1 餘量，往 −Y 凸 2.5 就直接超床。
 
     # ★ 第八輪刪掉後牆的頂蓋承托肩：頂蓋改成自 +Y 滑入側板槽，兩側被槽夾住、
     #   後端被鉤唇壓住，這條肩已經說不出它承住了什麼（硬規則 13）。
     #   刪掉它同時解掉一件事：電源自上方落入時不必再為了它橫移 X。
+    # ★ 第十三輪：後牆內面補一道**與側槽同 z 帶**的頂蓋槽（使用者：後牆好像沒有卡槽）。
+    #   第十二輪這一面是光的，頂蓋往 −Y 推到底沒有任何面擋住它 —— 六向保持力表裡
+    #   −Y 那一格靠的是鉤唇上兩顆 detent 的摩擦。槽底面就是止擋面，
+    #   而且頂蓋後緣從此是被夾住的舌（+Z 也多一道約束），不是一條懸空邊。
+    #   槽深 TOP_REAR_LIP + SLIDE_FIT = 1.60，槽背仍留 GROOVE_BACK_MIN = 0.80。
+    #   槽只開在後舌真的存在的兩段（top_rear_tab_bands）—— 開滿整條寬度的話，
+    #   碟架與電源正上方那些段會白白把牆削成 0.8 厚。
+    for tx0, tx1 in D.top_rear_tab_bands():
+        panel = panel.cut(
+            box(
+                tx0 - D.SLIDE_FIT,
+                y_inner - (D.TOP_REAR_LIP + D.SLIDE_FIT),
+                D.INNER_TOP_Z - D.TOP_T,
+                tx1 + D.SLIDE_FIT,
+                y_inner + 0.1,
+                D.INNER_TOP_Z + D.SLIDE_FIT,
+            )
+        )
+
     # ★ 頂鉤唇：頂蓋自 +Y 滑到底之後，後端鑽進這片唇的**下方** → 頂蓋不能再往上抬，
     #   側板也就抽不上去（側板頂端被頂蓋的 T 槽鉤著）。這是整條互鎖鏈的收尾。
     panel = panel.fuse(
@@ -624,50 +561,6 @@ def make_rear_panel():
         )
     )
 
-    # 底板低位槽：後牆自 −Y 推上來，底板後緣的舌插進這道槽（見 make_bottom_tray）
-    # ★ X 範圍要含底板**兩側的舌**（底板比內腔寬），否則兩端各干涉。
-    # ★ 第十輪：槽底自 −0.1 抬到 FLOOR_LEDGE_T。第九輪這道槽是**開穿到牆底**的
-    #   （探針：舌下方料 0.00 mm³，側板對照 144.00）—— 使用者第九輪問「底板跟
-    #   左右板之間真的有滑蓋嗎」，那一輪只修了側板，**後牆這一道原封不動**。
-    #   同一個病灶修了一半、另一半留著，下一輪就會被使用者再問一次（他問了）。
-    xlt = floor_edge_x(True)[1]
-    xrt = floor_edge_x(False)[1]
-    panel = panel.cut(
-        box(
-            xlt - D.SLIDE_FIT,
-            y_inner - (D.FLOOR_LIP + D.SLIDE_FIT),
-            D.FLOOR_LEDGE_T,
-            xrt + D.SLIDE_FIT,
-            y_inner + 0.1,
-            D.FLOOR_T + D.SLIDE_FIT,
-        )
-    )
-    # 槽頂的 detent 凹坑（底板舌上表面有對應的半球）
-    for s in floor_rear_detents(grow=0.15):
-        panel = panel.cut(s)
-    # 兩側定位舌：後牆兩端往前伸出一片薄舌，插進側板後端內面的槽（X 定位）。
-    # ★ 這裡**不能用燕尾**：燕尾大端 8 > 牆厚 2.4，兩片 2.4 的板在角落根本咬不住。
-    # ★ 舌要長在**側板牆體那一側**（往機殼外），不是往機殼內：往內的話右邊那片
-    #   x∈[33.59, 34.79] 會直接戳進主板（板右緣 34.29）與 Area B 淨空。
-    for is_left, (xc, sgn) in zip(
-        (True, False), ((D.CASE_LEFT + t, -1), (D.CASE_RIGHT - t, +1))
-    ):
-        panel = panel.fuse(
-            box(
-                min(xc, xc + sgn * D.REAR_TAB_T),
-                y_inner - 0.5,  # 反向埋入牆體
-                D.FLOOR_T,
-                max(xc, xc + sgn * D.REAR_TAB_T),
-                y_inner + D.REAR_TAB_D,
-                # ★ 頂端必須停在頂蓋舌槽的**底下**：定位舌與頂蓋側舌走的是側板上
-                #   同一道 x 帶，長到 INNER_TOP_Z 就會在槽裡對撞（實測 8.64 mm³）。
-                D.INNER_TOP_Z - D.TOP_T - D.SLIDE_FIT,
-            )
-        )
-        # 母件：舌上自根部往前開缺口，側板口袋底的楔扣進去（公母第十輪對調、
-        # 第十一輪半球→不對稱楔，直角面擋住 −Y 拉出）
-        for s in rear_tab_notches(is_left):
-            panel = panel.cut(s)
     return panel.removeSplitter()
 
 
@@ -685,7 +578,7 @@ def make_side(is_left: bool):
       → 槽底必須高過 129.37。左側則要避開電源（y 只到 149.34，本來就不重疊）。
     """
     t = D.WALL
-    y0, y1 = D.CASE_REAR + t, D.BAY_SPLIT_Y
+    y0, y1 = D.CASE_REAR + D.WALL - D.CHASSIS_OVERLAP, D.BAY_SPLIT_Y
     if is_left:
         x0, x1 = D.CASE_LEFT, D.CASE_LEFT + t
         xi, sgn = x1, -1  # 內面、往外挖的方向
@@ -704,27 +597,27 @@ def make_side(is_left: bool):
         a, b = sorted((xi, xi + sgn * depth))
         return box(a, ya, z_lo, b, yb, z_hi)
 
-    # ① 底板舌槽（沿 Y 全長，前端開口讓底板自 +Y 滑入／側板自 +Y 滑上底板）
-    # ★ 第九輪：槽底自 −0.1 抬到承載唇高度（第八輪槽開穿到牆底，槽下方 0.00 mm³）。
-    # ★ 第十輪：**上下左右四個方向都補 SLIDE_FIT**。第九輪只補了「槽頂 +SLIDE_FIT」，
-    #   槽底、槽深兩處仍是零間隙 —— 舌尖與槽底共面、舌底面與承載唇共面。
-    #   槽深 = FLOOR_LIP + SLIDE_FIT = 1.60，牆背後剩 0.80（＝最小可印壁厚）。
-    wall = wall.cut(
-        groove(
-            D.FLOOR_LEDGE_T,
-            D.FLOOR_T + D.SLIDE_FIT,
-            y0 - 0.1,
-            y1 + 0.1,
-            D.FLOOR_LIP + D.SLIDE_FIT,
-        )
-    )
-    # ①b 底板側緣 bead 的凹槽（滑到底才落進去 → 這就是「卡上底板」的那一下）
-    for c in floor_detents(is_left, grow=D.SLIDE_FIT / 2):
-        wall = wall.cut(c)
     # ② 碟架舌槽。★ 第十一輪：後端改成**盲端**（RACK_STOP_Y）＝碟架推到底的止擋面。
     #   第十輪這裡開到 TRAY_Y0 − 1.0，比最後那條側舌後緣還後面 3 mm → 碟架浮 3 mm。
     wall = wall.cut(
         groove(D.RACK_RAIL_Z0, D.RACK_RAIL_Z1, D.RACK_STOP_Y, y1 + 0.1, D.RACK_RAIL_T)
+    )
+    # ★ 第十三輪：碟架**承托肩**（使用者：溝槽太淺，能不能往內伸一塊擋板托住碟架）。
+    #   槽從此只負責 +Z 約束，重量改由這條肩承擔：橫樑底面比肩頂高 SLIDE_FIT，
+    #   載重後落 0.30 就坐實 —— 滑入時不磨、坐下去是面接觸（硬規則 19）。
+    #   下表面 45° 斜撐：Chassis 地板貼床時自撐，不多長一根支撐。
+    lz0, lz1 = D.RACK_LEDGE_Z0, D.RACK_LEDGE_Z1
+    ly0, ly1 = D.RACK_LEDGE_Y0, D.RACK_LEDGE_Y1
+    xin = xi - sgn * D.RACK_LEDGE_D  # 肩的內端（往機殼內側）
+    xroot = xi + sgn * D.CHASSIS_OVERLAP  # 根部反向埋進牆料（硬規則 1）
+    la, lb = sorted((xroot, xin))
+    wall = wall.fuse(box(la, ly0, lz0, lb, ly1, lz1))
+    wall = wall.fuse(
+        tri_prism_xz(
+            [(xroot, lz0), (xin, lz0), (xroot, lz0 - D.RACK_LEDGE_GUSSET)],
+            ly0,
+            ly1,
+        )
     )
     # ③ 頂蓋舌槽（槽頂 = INNER_TOP_Z + SLIDE_FIT，其上仍有 2.70 牆料 → 頂蓋抬不出去）
     # ★ 第十輪：槽深 1.2 → TOP_LIP + SLIDE_FIT = 1.60。第九輪頂蓋的舌**只咬進 0.40 mm**
@@ -739,20 +632,6 @@ def make_side(is_left: bool):
             D.TOP_LIP + D.SLIDE_FIT,
         )
     )
-    # ④ 後牆定位舌的槽 + detent 凹坑（槽深加 SLIDE_FIT，否則舌尖與槽底共面）
-    wall = wall.cut(
-        groove(
-            D.FLOOR_T,
-            D.INNER_TOP_Z,
-            y0 - 0.1,
-            y0 + D.REAR_TAB_D + D.SLIDE_FIT,
-            D.REAR_TAB_T + D.SLIDE_FIT,
-        )
-    )
-    # ★ 第十輪：detent 公母對調 —— 球長在側板的槽底上（純加料，側板一點都不用挖），
-    #   後牆的定位舌上開對應的貫穿小孔。理由見 rear_tab_detents() 的註解。
-    for s in rear_tab_detents(is_left):
-        wall = wall.fuse(s)
     # ⑤ 前罩搭接：外表面前段減薄，前罩套上去之後外表面齊平（單一長方體）
     # ★ 第九輪：減薄量加上 SLIDE_FIT。第八輪是 nominal 零間隙 —— 布林 common=0.000
     #   被讀成「不干涉」，其實是「套不進去」。**「≤ 上限」的地方也要檢查「≥ 下限」。**
@@ -764,48 +643,73 @@ def make_side(is_left: bool):
     a, b = sorted((xo, xo + inward * lap_t))
     for tz0, tz1 in side_lap_thin_bands():
         wall = wall.cut(box(a, y1 - D.SHROUD_LAP, tz0, b, y1 + 0.1, tz1))
-    # ⑥ 前罩 detent：凸半球長在減薄面上，前罩搭接殼有對應凹坑。
-    #   半徑受**減薄後剩下的料厚**限制：剩 WALL − lap_t = 0.90 → 2R ≤ 0.90 + DEPTH。
-    for s in shroud_detents(is_left):
-        wall = wall.fuse(s)
     return wall.removeSplitter()
 
 
-def make_side_left_mb():
-    return make_side(True)
+def make_chassis_body():
+    """地板、左右牆、後牆真實融合成一個可由 A1 一次列印的基準件。"""
+    body = fuse_all([
+        make_chassis_floor(),
+        make_rear_panel(),
+        make_side(True),
+        make_side(False),
+    ])
+    # 球面 detent 與 spline 盲牙都排在最後一次 removeSplitter 之後。
+    for is_left in (True, False):
+        for s in shroud_detents(is_left):
+            body = body.fuse(s)
+    for s in shroud_lap_detents(False):
+        body = body.fuse(s)
+    for s in top_detents():
+        body = body.fuse(s)
 
-
-def make_side_right_mb():
-    return make_side(False)
+    cutter = make_mb_socket_cutter()
+    for x, y in D.HOLES_MM.values():
+        body = body.cut(place_mb_socket_cutter(cutter, x, y))
+    # ★ 第十三輪：PCIeBar 的兩個鎖點 —— 同一支盲牙 cutter，軸轉到 +Y。
+    #   舊的 Ø2.8 pilot + #6-32 自攻已退役（使用者：壓條根本沒有用）。
+    for hx in D.pcie_lock_x():
+        body = body.cut(place_pcie_lock_socket(cutter, hx))
+    return body
 
 
 def make_pcie_bar():
     """
-    PCIe 壓條 —— 第八輪移到機殼外面（使用者：「壓條通常長在機殼外面」），
-    第九輪把固定方式從「沿 X 滑進 T 軌」改成 **keyhole：壓上去、往下落 3.5**。
+    5 mm 厚共享壓條；四壓舌定位擋板，兩顆 `MB_Screw` 鎖進後牆繫樑上的印製盲內牙。
 
-    改的理由是使用者主訴的結構問題：沿 X 滑就得讓四個壓舌走完全程，
-    於是後牆被開了一條連續橫縫，三根 1.42 mm 的肋變成 112.75 mm 的懸臂。
-    keyhole 不需要沿 X 走，橫縫可以刪掉，肋回到兩端固定。
-
-    構造：一片掛在後牆外兩顆蘑菇柱上的板，內側四個舌各自穿過自己那個開孔的
-    抬升讓位帶，壓在擋板頂緣上方 PCIE_HOLD_GAP。舌只伸入 2.0（<牆厚 2.4），
-    **機殼內部一點料都沒有**。拆：抬 3.5 mm、往 −Y 拔，不必拆頂蓋。
+    ★ 第十三輪（使用者：那個 PCIe 壓條根本沒有用）。舊版是 #6-32 **自攻**進 PETG
+      的 Ø2.8 盲 pilot —— 保持力全靠塑膠被鋼牙擠開，鎖第二次就滑牙。現在孔裡
+      真的有牙（與主板固定同一套已驗證的 ruled-loft）。
+      螺絲不新增第九種 STL 的條件是**夾持厚 = PCB_T**：鎖點處挖沉頭凹，凹底剩
+      `PCIE_BAR_SEAT_T`，螺絲頭沉進去 —— 後凸也因此比舊版少一個頭高。
     """
     bx0, bx1 = D.pcie_bar_x()
     y_out = D.CASE_REAR
-    bar = box(bx0, y_out - D.PCIE_BAR_T, D.PCIE_BAR_Z0, bx1, y_out, D.PCIE_BAR_Z1_TOP)
-    for hx in D.pcie_hook_x():
-        bar = bar.cut(pcie_bar_slot(hx))
-        # detent 凹坑：比公件半球大 0.15，落到定位時**不干涉**（過盈只發生在行程中）
-        for d in hook_detents(hx, grow=0.15):
-            bar = bar.cut(d)
-    # 四個壓舌：穿過開孔，底面＝防上抬面
+    mount_y = D.pcie_bar_mount_y()
+    bar = box(
+        bx0,
+        mount_y - D.PCIE_BAR_T,
+        D.PCIE_BAR_Z0,
+        bx1,
+        mount_y,
+        D.PCIE_BAR_Z1_TOP,
+    )
+    # 兩個鎖點：沉頭凹（自外表面往內，留 SEAT_T）+ 貫穿的通孔
+    seat_y = mount_y - D.PCIE_BAR_SEAT_T
+    for hx in D.pcie_lock_x():
+        bar = bar.cut(
+            bore_y(mount_y - D.PCIE_BAR_T - 0.5, seat_y, hx, D.PCIE_LOCK_Z,
+                   D.PCIE_BAR_CBORE_D)
+        )
+        bar = bar.cut(
+            bore_y(mount_y - D.PCIE_BAR_T - 0.5, mount_y + 0.5, hx, D.PCIE_LOCK_Z,
+                   D.PCIE_BAR_HOLE_D)
+        )
     for cx in D.pcie_centers():
         bar = bar.fuse(
             box(
                 cx - D.PCIE_BAR_TAB_W / 2,
-                y_out,  # 自本體內側面長起（體積相接，不是面接觸）
+                mount_y - 0.5,
                 D.PCIE_BAR_Z0,
                 cx + D.PCIE_BAR_TAB_W / 2,
                 y_out + D.PCIE_BAR_TAB_D,
@@ -842,14 +746,23 @@ def make_top_mb():
         (D.FLOOR_X1 + D.TOP_LIP, D.FLOOR_X1 - g - D.TOP_FUSE),
     ):
         top = top.fuse(box(min(xa, xb), y0, z0 - D.TOP_T, max(xa, xb), y1, z0))
+    # ★ 第十三輪：後緣下伸舌，插進後牆內面新開的槽（與側槽同 z 帶，沿 −Y 插入）。
+    #   它給的是側槽給不了的那一格：**−Y 止擋**。舌只伸 TOP_REAR_LIP，槽深多
+    #   SLIDE_FIT，所以推到底時是舌的端面抵住槽底，不是頂蓋本體撞牆。
+    for tx0, tx1 in D.top_rear_tab_bands():
+        top = top.fuse(
+            box(tx0, y0 - D.TOP_REAR_LIP, z0 - D.TOP_T, tx1, y0 + D.TOP_FUSE, z0)
+        )
     # 後端**半搭接**：切掉上半，滑到底時鑽進後牆頂鉤唇（同樣只有上半）的下方
     # ★ 第十輪：切深加 SLIDE_FIT。第九輪切到剛好 TOP_HOOK_T，於是頂蓋的切面與
     #   鉤唇的底面**共面**——頂蓋要在鉤唇下方磨進去。鉤唇的職責是「限制上抬」，
     #   限位面本來就該留間隙（頂蓋剩 1.20 仍 > 最小可印壁厚）。
     top = top.cut(
         box(x0 - D.TOP_LIP - 1, y0 - 1, z1 - D.TOP_HOOK_T - D.SLIDE_FIT,
-            x1 + D.TOP_LIP + 1, y0 + D.TOP_HOOK_D + g, z1)
+            x1 + D.TOP_LIP + 1, D.FLOOR_Y0 + D.TOP_HOOK_D + D.SLIDE_FIT, z1)
     )
+    for s in top_detents(grow=0.15):
+        top = top.cut(s)
     # 前端上表面減薄：前罩的頂舌填回去，套上之後頂面齊平（第八輪前罩根本沒搭到頂）
     top = top.cut(
         box(
@@ -894,6 +807,28 @@ def make_hdd_rack():
         box(D.RACK_POST_X0, y0, z0, D.RACK_POST_X1, y1, z1),  # 右立板（已讓開接頭區）
         box(D.RACK_X0, y0, D.HDD_TOP_Z, D.RACK_POST_X1, y1, z1),  # 頂板
     ]
+    # lv0 托盤下方承托格柵：三橫樑由中央縱樑連成一體，頂面保留 SLIDE_FIT。
+    for by in D.RACK_BASE_BEAM_Y:
+        parts.append(
+            box(
+                D.RACK_X0,
+                by - D.RACK_BASE_BEAM_W / 2,
+                z0,
+                D.RACK_POST_X1,
+                by + D.RACK_BASE_BEAM_W / 2,
+                D.RACK_BASE_Z1,
+            )
+        )
+    parts.append(
+        box(
+            D.RACK_BASE_SPINE_X - D.RACK_BASE_SPINE_W / 2,
+            y0,
+            z0,
+            D.RACK_BASE_SPINE_X + D.RACK_BASE_SPINE_W / 2,
+            y1,
+            D.RACK_BASE_Z1,
+        )
+    )
     # 左右橫樑（把碟架繫到兩側側板；置中之後兩邊都懸空，所以兩邊都要）。
     # 各分兩條而不是一整片，中間讓線束穿過。
     for by in D.RACK_BEAM_Y:
@@ -907,9 +842,11 @@ def make_hdd_rack():
             )
     rack = fuse_all(parts)
 
-    # 側舌：自橫樑末端伸出，插進側板內面的槽（兩側對稱）
+    # 側舌：自橫樑末端伸出，插進側板內面的槽（兩側對稱）。
+    # ★ 第十三輪：只有落在 Chassis 側牆 y 範圍內的橫樑才有舌 —— 第三根樑在前罩段，
+    #   那裡沒有牆槽，它是純粹坐在前罩承托肩上的承重樑（唯一來源 RACK_RAIL_BEAM_Y）。
     f = D.SLIDE_FIT
-    for by in D.RACK_BEAM_Y:
+    for by in D.RACK_RAIL_BEAM_Y:
         for xi, sgn in ((D.CASE_LEFT + D.WALL, -1), (D.CASE_RIGHT - D.WALL, +1)):
             xa, xb = sorted((xi - sgn * 1.0, xi + sgn * (D.RACK_RAIL_T - f)))
             rack = rack.fuse(
@@ -1028,11 +965,44 @@ def make_front_shroud():
     # ★ 第十輪：X 範圍改由 floor_edge_x() 導出並再內縮 SLIDE_FIT。
     #   寫死 FLOOR_X0/FLOOR_X1 的話，舌會蓋到**底板自己的兩側舌**上（那兩條沒有減薄，
     #   它們要留在側板的槽裡）—— 實測每側 3.24 mm³，共 6.48。減薄帶到哪裡，舌就到哪裡。
-    fl = floor_edge_x(True)[0] + D.SLIDE_FIT
-    fr = floor_edge_x(False)[0] - D.SLIDE_FIT
+    fl = D.FLOOR_X0 + D.SLIDE_FIT
+    fr = D.FLOOR_X1 - D.SLIDE_FIT
     shell = shell.fuse(
         box(fl, y0, D.FLOOR_T - D.SHROUD_FLOOR_LAP_T + D.SLIDE_FIT, fr,
             D.SHROUD_Y0 + 0.1, D.FLOOR_T)
+    )
+    # 四個先進入 Chassis 的後緣切 45° 導入，避免薄搭接殼正面撞上定位邊。
+    lead = D.SHROUD_LEAD_IN
+    shell = shell.cut(
+        tri_prism_xy(
+            [(x0 + lt, y0), (x0 + lt, y0 + lead), (x0 + lt - lead, y0)],
+            -0.1,
+            z1 + 0.1,
+        )
+    )
+    shell = shell.cut(
+        tri_prism_xy(
+            [(x1 - lt, y0), (x1 - lt, y0 + lead), (x1 - lt + lead, y0)],
+            -0.1,
+            z1 + 0.1,
+        )
+    )
+    shell = shell.cut(
+        tri_prism_yz(
+            [(y0, z1 - D.SHROUD_TOP_LAP_T),
+             (y0 + lead, z1 - D.SHROUD_TOP_LAP_T),
+             (y0, z1 - D.SHROUD_TOP_LAP_T + lead)],
+            x0 - 0.1,
+            x1 + 0.1,
+        )
+    )
+    floor_z0 = D.FLOOR_T - D.SHROUD_FLOOR_LAP_T + D.SLIDE_FIT
+    shell = shell.cut(
+        tri_prism_yz(
+            [(y0, floor_z0), (y0 + lead, floor_z0), (y0, floor_z0 + lead)],
+            fl - 0.1,
+            fr + 0.1,
+        )
     )
     # 主板柱讓位槽：滑進來的路上會撞到 L／M 兩根柱（底板在同樣的 X 帶留了實心柱腳）
     for bx0, bx1 in shroud_floor_stud_bands():
@@ -1043,6 +1013,52 @@ def make_front_shroud():
     shell = shell.cut(
         box(x0 + t, D.SHROUD_Y0 - 0.1, D.FLOOR_T, x1 - t, y1 - D.TRAY_FACE_T, z1 - t)
     )
+    # ★ 第十三輪：搭接帶補**內壁**，把 Chassis 的牆整片夾在中間（使用者：改成有縫隙
+    #   插進去、兩邊夾住，不要單邊凸點）。第十二輪這一帶只有外壁 SHROUD_LAP_T 貼在
+    #   牆的外面減薄帶上，牆的內面整片是光的 —— 前罩對牆只有一個方向有料，
+    #   側向保持全靠 detent 的摩擦。
+    #   內壁只能長在 side_lap_thin_bands()（牆內面沒有滑槽的那一段），再與
+    #   SHROUD_INNER_Z0/Z1 取交集：下限讓開 Area B 淨空（右牆內面到主板右緣只有
+    #   0.50，內壁是長在板上方的料），上限讓開碟架承托肩的 45° 斜撐底。
+    #   **接合塊不可省**：內壁貼的是 Chassis 牆的內面，而前罩主體壁的內面比它外
+    #   1.10 mm —— 少了這一塊，內壁就是兩片自由飄浮的板（實測 solids=3）。
+    for xw, inward in ((x0 + D.WALL, 1), (x1 - D.WALL, -1)):  # Chassis 牆內面
+        ia, ib = sorted((xw + inward * f, xw + inward * (f + D.SHROUD_INNER_T)))
+        xbody = (x0 + t) if inward > 0 else (x1 - t)  # 前罩主體壁的內面
+        ja, jb = sorted((xbody, ib))
+        for tz0, tz1 in side_lap_thin_bands():
+            iz0 = max(tz0, D.SHROUD_INNER_Z0)
+            iz1 = min(tz1, D.SHROUD_INNER_Z1)
+            if iz1 - iz0 < 1.0:
+                continue
+            # 內壁本體：後端比外壁短 SHROUD_LEAD_IN，讓外壁的 45° 導入先接觸導向；
+            # 前端越過分界面 CHASSIS_OVERLAP，才與接合塊有**體積**重疊。
+            shell = shell.fuse(
+                box(ia, y0 + D.SHROUD_LEAD_IN, iz0,
+                    ib, D.SHROUD_Y0 + D.CHASSIS_OVERLAP, iz1)
+            )
+            # 接合塊只能在 y >= SHROUD_Y0 —— 它的 x 帶落在 Chassis 牆的厚度裡，
+            # 往回多 0.1 就是兩件重疊（實測 20.22 mm³）。
+            shell = shell.fuse(
+                box(ja, D.SHROUD_Y0, iz0, jb, D.SHROUD_Y0 + D.SHROUD_INNER_JOIN, iz1)
+            )
+
+    # ★ 第十三輪：前罩段的碟架承托肩。Chassis 只到 BAY_SPLIT_Y，碟架卻一路到
+    #   HDD_Y1 —— 前段 49.76 mm 第十二輪底下什麼都沒有。碟架第三根橫樑坐在這條肩上。
+    #   貼床端（−Y）做 45° 楔形引入，前罩維持「無支撐」preset。
+    lz0, lz1 = D.RACK_LEDGE_Z0, D.RACK_LEDGE_Z1
+    ly0, ly1 = D.SHROUD_LEDGE_Y0, D.SHROUD_LEDGE_Y1
+    lead = D.SHROUD_LEDGE_LEAD
+    for xw, inward in ((x0 + t, 1), (x1 - t, -1)):
+        la, lb = sorted((
+            xw - inward * D.CHASSIS_OVERLAP,  # 根部反向埋進前罩壁（硬規則 1）
+            xw + inward * D.SHROUD_LEDGE_D,
+        ))
+        shell = shell.fuse(box(la, ly0 + lead, lz0, lb, ly1, lz1))
+        shell = shell.fuse(
+            tri_prism_yz([(ly0, lz1), (ly0 + lead, lz1), (ly0 + lead, lz0)], la, lb)
+        )
+
     # 托盤前擋板穿過的口（★ 碟架置中之後這個口自己就對稱了）
     g = D.TOP_FIT_GAP
     fx0, fx1 = D.tray_opening_x()
@@ -1106,9 +1122,10 @@ def make_pcie_blank_parked():
     return s
 
 
-def make_mb_nut_placed():
-    """總成裡放 **B 孔那一顆**（工作位），讓標準干涉檢查直接驗到旋合。實印 9 顆。"""
-    return place_mb_nut(make_mb_nut(), D.HOLES_MM["B"][0], D.HOLES_MM["B"][1], D.BOARD_TOP_Z)
+def make_mb_screw_placed():
+    """總成只顯示 B 孔一顆；實印份數由 PART_QTY 展開九顆。"""
+    x, y = D.HOLES_MM["B"]
+    return place_mb_screw(make_mb_screw(), x, y)
 
 
 def add_obj(doc, name, shape, label=None):
@@ -1125,16 +1142,11 @@ def export_stl(obj, path, deflection=0.25):
 
 # 總成預覽配色 (R,G,B,A)
 PREVIEW_COLORS = {
-    "Bottom_Tray": (0.20, 0.45, 0.85, 0.0),
-    "Rear_IO_PCIe": (0.92, 0.72, 0.12, 0.0),
-    "Side_Left_MB": (0.55, 0.58, 0.62, 0.0),
-    "Side_Right_MB": (0.55, 0.58, 0.62, 0.0),
+    "Chassis_Body": (0.28, 0.48, 0.78, 0.0),
     "Top_MB": (0.72, 0.74, 0.78, 0.55),  # 半透明看內部
-    "Top_HDD": (0.72, 0.74, 0.78, 0.55),
-    "HDD_Cage": (0.15, 0.55, 0.35, 0.0),
     "PCIeBlank": (0.85, 0.85, 0.88, 0.0),
     "PCIeBar": (0.90, 0.35, 0.20, 0.0),
-    "MB_Nut": (0.95, 0.55, 0.10, 0.0),
+    "MB_Screw": (0.95, 0.55, 0.10, 0.0),
 }
 
 
@@ -1166,18 +1178,25 @@ def build(export=True):
 
     parts = {}
     makers = [
-        ("Bottom_Tray", make_bottom_tray, "底板_主板托盤"),
-        ("Rear_IO_PCIe", make_rear_panel, "後牆_IO與PCIe"),
-        ("Side_Left_MB", make_side_left_mb, "左側板_主板段"),
-        ("Side_Right_MB", make_side_right_mb, "右側板_主板段"),
+        ("Chassis_Body", make_chassis_body, "機殼本體（底板＋左右牆＋後牆一體式）"),
         ("Top_MB", make_top_mb, "頂蓋（單片，自 +Y 滑入）"),
         ("Front_Shroud", make_front_shroud, "前罩_含進氣柵與電源按鈕"),
         ("HDD_Rack", make_hdd_rack, "碟架_四層導軌（平躺，疊在主板前段上方）"),
         ("HDD_Tray", lambda: make_hdd_tray_placed(0), "碟托盤（總成示第 0 層，實印 4 份）"),
         ("PCIeBlank", make_pcie_blank_parked, "PCIe槽蓋（備件，停放於機殼外）"),
-        ("PCIeBar", make_pcie_bar, "PCIe壓條（外置；自機殼右外側滑入）"),
-        ("MB_Nut", make_mb_nut_placed, "主板壓帽（總成示 B 孔一顆，實印 9 顆）"),
+        ("PCIeBar", make_pcie_bar, "PCIe壓條（外置；2× MB_Screw 鎖印製盲內牙）"),
+        ("MB_Screw", make_mb_screw_placed,
+         "印製螺絲（總成示 B 孔一顆；主板 9 + PCIeBar 2 = 11 顆）"),
     ]
+    maker_keys = [name for name, _, _ in makers]
+    if set(maker_keys) != set(D.STL_NAMES) or len(maker_keys) != len(set(maker_keys)):
+        raise SystemExit(
+            f"makers/STL_NAMES 不一致：missing={sorted(set(D.STL_NAMES) - set(maker_keys))} "
+            f"extra={sorted(set(maker_keys) - set(D.STL_NAMES))}"
+        )
+    extra_colors = set(PREVIEW_COLORS) - set(D.STL_NAMES)
+    if extra_colors:
+        raise SystemExit(f"PREVIEW_COLORS 含退役件：{sorted(extra_colors)}")
     for name, fn, label in makers:
         parts[name] = add_obj(doc, name, fn(), label)
     doc.recompute()
@@ -1202,13 +1221,13 @@ def build(export=True):
         # 列印姿態與總成姿態不同的件：STL 走各自的原型
         own_shape = {
             "PCIeBlank": make_pcie_blank,
-            "MB_Nut": make_mb_nut,
+            "MB_Screw": make_mb_screw,
             "HDD_Tray": make_hdd_tray,  # 總成裡是第 0 層，STL 走未平移的原型
         }
         for key, fname in stl_map.items():
             path = os.path.join(STL_DIR, fname)
             # 螺紋是 0.5 mm 的特徵，0.25 的弦差會把牙磨平
-            defl = 0.05 if key in ("Bottom_Tray", "MB_Nut") else 0.25
+            defl = 0.05 if key in ("Chassis_Body", "MB_Screw") else 0.25
             if key in own_shape:
                 Mesh.Mesh(own_shape[key]().tessellate(defl)).write(path)
                 sz = os.path.getsize(path)
