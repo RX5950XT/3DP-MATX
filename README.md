@@ -142,8 +142,7 @@ python 腳本\組裝圖.py                          # 爆炸／逐步 ×5／卡�
 列印設定/      Bambu Studio process preset ×3
 CAD/           FreeCAD 總成檔
 測試/          參數回歸測試（71 tests）
-tasks/         規劃與歷輪教訓
-CONTEXT.md     開發交接文件（接手先讀這個）
+tasks/         開發交接（todo.md，接手先讀這個）與歷輪教訓
 CLAUDE.md      專案硬規則（與 AGENTS.md 同內容）
 ```
 

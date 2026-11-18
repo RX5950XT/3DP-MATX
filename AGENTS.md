@@ -6,7 +6,7 @@
 碟的接頭面前方留 30 mm 走線區）、Top／Front／HDD Rack／HDD Tray 保持可拆滑配、
 PCIe 壓條長在機殼外並由 2 顆印製 `MB_Screw` 鎖繫樑盲內牙、外殼是單一長方體。**8 種 STL。**
 **13.77 L**（252.68 × 302.61 × 180.12）。
-上下文請先讀 `CONTEXT.md`，教訓在 `tasks/lessons.md`。
+上下文請先讀 `tasks/todo.md`（交接，保持 ≤100 行），教訓在 `tasks/lessons.md`。
 
 > ✅ **第十輪起 Area A 淨空 = 76.20 = microATX Table 6 required**（仍 < recommended 88.90）。
 > 第八～九輪的 50.00 偏離已消除，**而且機殼高度一點都沒有變**：電源本來頭上有
@@ -17,7 +17,7 @@ PCIe 壓條長在機殼外並由 2 顆印製 `MB_Screw` 鎖繫樑盲內牙、外
 ## 唯一真實來源
 
 `腳本/參數.py`。所有尺寸都在這裡，文件是它的投影。
-改參數 → 同步改 `規格/*.md`、`文件/*.md`、`CONTEXT.md`。
+改參數 → 同步改 `規格/*.md`、`文件/*.md`、`tasks/todo.md`。
 
 ## 指令（路徑必須走 ASCII junction）
 
